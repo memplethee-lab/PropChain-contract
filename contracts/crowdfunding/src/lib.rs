@@ -45,8 +45,13 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq,
-        scale::Encode, scale::Decode,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -59,8 +64,13 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq,
-        scale::Encode, scale::Decode,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -71,8 +81,13 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq,
-        scale::Encode, scale::Decode,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -83,8 +98,13 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq,
-        scale::Encode, scale::Decode,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -95,8 +115,13 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq,
-        scale::Encode, scale::Decode,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -108,9 +133,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct Campaign {
@@ -124,9 +147,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct InvestorProfile {
@@ -137,9 +158,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct Milestone {
@@ -153,9 +172,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct Proposal {
@@ -168,9 +185,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct ShareListing {
@@ -182,9 +197,7 @@ mod propchain_crowdfunding {
     }
 
     #[derive(
-        Debug, Clone, PartialEq,
-        scale::Encode, scale::Decode,
-        ink::storage::traits::StorageLayout,
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct RiskProfile {
@@ -215,7 +228,7 @@ mod propchain_crowdfunding {
         admin: AccountId,
         campaigns: Mapping<u64, Campaign>,
         campaign_count: u64,
-        campaign_ids: Vec<u64>,                          // index for iteration
+        campaign_ids: Vec<u64>, // index for iteration
         investor_profiles: Mapping<AccountId, InvestorProfile>,
         investments: Mapping<(u64, AccountId), u128>,
         milestones: Mapping<u64, Milestone>,
@@ -457,7 +470,8 @@ mod propchain_crowdfunding {
             if current == 0 {
                 campaign.investor_count += 1;
             }
-            self.investments.insert((campaign_id, caller), &(current + amount));
+            self.investments
+                .insert((campaign_id, caller), &(current + amount));
             campaign.raised_amount += amount;
             if campaign.raised_amount >= campaign.target_amount {
                 campaign.status = CampaignStatus::Funded;
@@ -465,7 +479,8 @@ mod propchain_crowdfunding {
             self.campaigns.insert(campaign_id, &campaign);
             let shares = (amount / 1000) as u64;
             let current_shares = self.share_holdings.get((campaign_id, caller)).unwrap_or(0);
-            self.share_holdings.insert((campaign_id, caller), &(current_shares + shares));
+            self.share_holdings
+                .insert((campaign_id, caller), &(current_shares + shares));
             self.env().emit_event(InvestmentMade {
                 campaign_id,
                 investor: caller,
@@ -794,8 +809,10 @@ mod propchain_crowdfunding {
                 .share_holdings
                 .get((listing.campaign_id, buyer))
                 .unwrap_or(0);
-            self.share_holdings
-                .insert((listing.campaign_id, buyer), &(buyer_shares + listing.shares));
+            self.share_holdings.insert(
+                (listing.campaign_id, buyer),
+                &(buyer_shares + listing.shares),
+            );
             self.listings.remove(listing_id);
             Ok(total_cost)
         }
@@ -892,7 +909,9 @@ mod propchain_crowdfunding {
 
         #[ink(message)]
         pub fn get_shares(&self, campaign_id: u64, investor: AccountId) -> u64 {
-            self.share_holdings.get((campaign_id, investor)).unwrap_or(0)
+            self.share_holdings
+                .get((campaign_id, investor))
+                .unwrap_or(0)
         }
 
         #[ink(message)]
@@ -933,7 +952,11 @@ mod propchain_crowdfunding {
                 }
             }
             if let Some(ref keyword) = filter.title_keyword {
-                if !summary.title.to_lowercase().contains(&keyword.to_lowercase()) {
+                if !summary
+                    .title
+                    .to_lowercase()
+                    .contains(&keyword.to_lowercase())
+                {
                     return false;
                 }
             }
@@ -1001,7 +1024,8 @@ mod propchain_crowdfunding {
         #[ink(message)]
         pub fn get_top_campaigns(&self, n: u64) -> Vec<CampaignSummary> {
             let n = n.min(50) as usize;
-            let mut summaries: Vec<CampaignSummary> = self.campaign_ids
+            let mut summaries: Vec<CampaignSummary> = self
+                .campaign_ids
                 .iter()
                 .filter_map(|id| self.campaigns.get(*id))
                 .map(|c| self.campaign_to_summary(&c))
@@ -1058,7 +1082,11 @@ mod propchain_crowdfunding {
                 .iter()
                 .filter_map(|id| {
                     let invested = self.investments.get((*id, investor)).unwrap_or(0);
-                    if invested > 0 { self.campaigns.get(*id) } else { None }
+                    if invested > 0 {
+                        self.campaigns.get(*id)
+                    } else {
+                        None
+                    }
                 })
                 .map(|c| self.campaign_to_summary(&c))
                 .collect()
@@ -1085,7 +1113,7 @@ mod tests {
     use super::*;
     use ink::env::{test, DefaultEnvironment};
     use propchain_crowdfunding::{
-        CampaignFilter, CampaignStatus, CrowdfundingError, RiskRating, RealEstateCrowdfunding,
+        CampaignFilter, CampaignStatus, CrowdfundingError, RealEstateCrowdfunding, RiskRating,
     };
 
     fn setup() -> RealEstateCrowdfunding {
@@ -1373,13 +1401,15 @@ mod tests {
     fn test_share_campaign() {
         let mut contract = setup();
         let accounts = test::default_accounts::<DefaultEnvironment>();
-        
+
         let campaign_id = contract
             .create_campaign("Viral Project".into(), 500_000)
             .unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        assert!(contract.share_campaign(campaign_id, "Twitter".into()).is_ok());
+        assert!(contract
+            .share_campaign(campaign_id, "Twitter".into())
+            .is_ok());
 
         let emitted_events = test::recorded_events().count();
         assert_eq!(emitted_events, 2); // CampaignCreated + CampaignShared

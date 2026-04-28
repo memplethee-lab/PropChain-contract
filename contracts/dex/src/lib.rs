@@ -1224,22 +1224,9 @@ mod dex {
             for competition_id in 1..=self.trade_competition_counter {
                 if let Some(comp) = self.trading_competitions.get(competition_id) {
                     competitions.push(comp);
-            non_reentrant!(self, {
-                if self.env().caller() != self.admin {
-                    return Err(Error::Unauthorized);
                 }
-                if self.admin_timelock_delay > 0 {
-                    return Err(Error::TimelockRequired);
-                }
-                self.liquidity_mining = LiquidityMiningCampaign {
-                    emission_rate,
-                    start_block,
-                    end_block,
-                    reward_token_symbol,
-                };
-                self.governance_config.emission_rate = emission_rate;
-                Ok(())
-            })
+            }
+            competitions
         }
 
         #[ink(message)]
@@ -1536,30 +1523,6 @@ mod dex {
                 reward_amount: reward,
             });
             Ok(reward)
-            non_reentrant!(self, {
-                self.accrue_rewards(pair_id)?;
-                let caller = self.env().caller();
-                let pool = self.pool(pair_id)?;
-                let mut position = self.position(pair_id, caller);
-                let accrued = pending_from_indices(
-                    position.lp_shares,
-                    pool.reward_index,
-                    position.reward_debt,
-                );
-                let reward = position.pending_rewards.saturating_add(accrued);
-                if reward == 0 {
-                    return Err(Error::RewardUnavailable);
-                }
-                position.pending_rewards = 0;
-                position.reward_debt = scaled_reward_debt(position.lp_shares, pool.reward_index);
-                self.positions.insert((pair_id, caller), &position);
-                let balance = self.governance_balances.get(caller).unwrap_or(0);
-                self.governance_balances
-                    .insert(caller, &balance.saturating_add(reward));
-                self.governance_config.total_supply =
-                    self.governance_config.total_supply.saturating_add(reward);
-                Ok(reward)
-            })
         }
 
         #[ink(message)]
@@ -2396,91 +2359,6 @@ mod dex {
             self.process_executable_limit_orders(pair_id)?;
 
             Ok(amount_out)
-        }
-
-        fn get_competition_leaderboard(&self, competition_id: u64) -> Vec<(AccountId, u128)> {
-            let participants = self
-                .competition_participants
-                .get(competition_id)
-                .unwrap_or_default();
-            participants
-                .into_iter()
-                .map(|account| {
-                    let score = self
-                        .competition_scores
-                        .get((competition_id, account))
-                        .unwrap_or(0);
-                    (account, score)
-                })
-                .collect()
-        }
-
-        fn is_competition_reward_claimed(&self, competition_id: u64, trader: AccountId) -> bool {
-            self.competition_claimed
-                .get((competition_id, trader))
-                .unwrap_or(false)
-        }
-
-        fn get_competition_score(&self, competition_id: u64, trader: AccountId) -> u128 {
-            self.competition_scores
-                .get((competition_id, trader))
-                .unwrap_or(0)
-        }
-
-        fn is_competition_active(&self, competition_id: u64) -> bool {
-            self.trading_competitions
-                .get(competition_id)
-                .map(|c| c.active)
-                .unwrap_or(false)
-        }
-
-        fn update_trade_competition_score(
-            &mut self,
-            pair_id: u64,
-            trader: AccountId,
-            volume: u128,
-        ) {
-            for competition_id in 1..=self.trade_competition_counter {
-                if let Some(competition) = self.trading_competitions.get(competition_id) {
-                    if !competition.active {
-                        continue;
-                    }
-                    if competition.pair_id.is_some_and(|p| p != pair_id) {
-                        continue;
-                    }
-                    let mut participants = self
-                        .competition_participants
-                        .get(competition_id)
-                        .unwrap_or_default();
-                    if !participants.contains(&trader) {
-                        participants.push(trader);
-                        self.competition_participants
-                            .insert(competition_id, &participants);
-                    }
-                    let current = self
-                        .competition_scores
-                        .get((competition_id, trader))
-                        .unwrap_or(0);
-                    let new_score = current.saturating_add(volume);
-                    self.competition_scores
-                        .insert((competition_id, trader), &new_score);
-                    self.env().emit_event(CompetitionScoreUpdated {
-                        competition_id,
-                        trader,
-                        score: new_score,
-                    });
-                }
-            }
-        }
-
-        fn get_all_competitions(&self) -> Vec<TradingCompetition> {
-            let mut competitions = Vec::new();
-            for competition_id in 1..=self.trade_competition_counter {
-                if let Some(comp) = self.trading_competitions.get(competition_id) {
-                    competitions.push(comp);
-                }
-            }
-            competitions
         }
 
         fn is_order_executable(&self, order: &TradingOrder) -> Result<bool, Error> {

@@ -5877,6 +5877,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "propchain-factory"
+version = "1.0.0"
+dependencies = [
+ "ink 5.1.1",
+ "parity-scale-codec",
+ "scale-info",
+]
+
+[[package]]
 name = "propchain-fees"
 version = "1.0.0"
 dependencies = [

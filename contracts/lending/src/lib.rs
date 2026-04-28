@@ -916,10 +916,10 @@ mod propchain_lending {
     }
 }
 
+pub use crate::propchain_lending::{LendingError, LoanStatus, PropertyLending};
 pub use crate::propchain_lending::{
     LendingError, PaymentSchedule, PaymentScheduleStatus, PropertyLending,
 };
-pub use crate::propchain_lending::{LendingError, LoanStatus, PropertyLending};
 
 #[cfg(test)]
 mod tests {
@@ -1177,9 +1177,7 @@ mod tests {
         contract.record_default(accounts.bob).unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let loan_id = contract
-            .apply_for_loan(1, 700_000, 1_000_000, 0)
-            .unwrap();
+        let loan_id = contract.apply_for_loan(1, 700_000, 1_000_000, 0).unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.alice);
         let approved = contract.underwrite_loan(loan_id).unwrap();

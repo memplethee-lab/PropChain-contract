@@ -17,8 +17,8 @@
 //! `try_aggregate` to collect per-call results without reverting.
 
 use ink::prelude::vec::Vec;
-use propchain_traits::multicall::{CallRequest, CallResult, MulticallError};
 use propchain_traits::constants::MAX_BATCH_SIZE;
+use propchain_traits::multicall::{CallRequest, CallResult, MulticallError};
 
 /// Hard cap on calls per multicall transaction.
 const MAX_MULTICALL_SIZE: u32 = MAX_BATCH_SIZE;
@@ -145,7 +145,10 @@ mod propchain_multicall {
             self.ensure_admin()?;
             self.paused = true;
             let caller = self.env().caller();
-            self.env().emit_event(PauseToggled { by: caller, paused: true });
+            self.env().emit_event(PauseToggled {
+                by: caller,
+                paused: true,
+            });
             Ok(())
         }
 
@@ -155,7 +158,10 @@ mod propchain_multicall {
             self.ensure_admin()?;
             self.paused = false;
             let caller = self.env().caller();
-            self.env().emit_event(PauseToggled { by: caller, paused: false });
+            self.env().emit_event(PauseToggled {
+                by: caller,
+                paused: false,
+            });
             Ok(())
         }
 
@@ -196,9 +202,7 @@ mod propchain_multicall {
 
             // Build a raw cross-contract call using ink!'s CallV1 builder.
             // selector_and_input layout: [0..4] = 4-byte selector, [4..] = encoded args.
-            let selector: [u8; 4] = req.selector_and_input[..4]
-                .try_into()
-                .unwrap_or([0u8; 4]);
+            let selector: [u8; 4] = req.selector_and_input[..4].try_into().unwrap_or([0u8; 4]);
 
             let outcome = ink::env::call::build_call::<ink::env::DefaultEnvironment>()
                 .call_v1(req.callee)
@@ -206,10 +210,8 @@ mod propchain_multicall {
                 .transferred_value(req.transferred_value)
                 .call_flags(ink::env::CallFlags::empty())
                 .exec_input(
-                    ink::env::call::ExecutionInput::new(
-                        ink::env::call::Selector::new(selector),
-                    )
-                    .push_arg(&req.selector_and_input[4..]),
+                    ink::env::call::ExecutionInput::new(ink::env::call::Selector::new(selector))
+                        .push_arg(&req.selector_and_input[4..]),
                 )
                 .returns::<Vec<u8>>()
                 .try_invoke();
