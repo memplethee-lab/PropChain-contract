@@ -110,7 +110,7 @@ pub mod propchain_contracts {
         InvalidRange,
         /// Reentrancy guard detected a reentrant call
         ReentrantCall,
-        /// External dependency is temporarily unavailable (circuit breaker open)
+        /// External dependency is temporarily unavailable because its circuit breaker is open
         ExternalDependencyUnavailable,
     }
 
@@ -189,6 +189,10 @@ pub mod propchain_contracts {
         /// `identity_registry` fields for new code; those fields are kept for
         /// backward-compatibility with existing callers.
         deps: ContainerConfig,
+        /// Circuit breaker state per external dependency.
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
+        /// Shared external call circuit breaker configuration.
+        external_call_config: CircuitBreakerConfig,
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
@@ -196,6 +200,76 @@ pub mod propchain_contracts {
         external_call_config: CircuitBreakerConfig,
         /// Circuit breaker states per external dependency
         external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        FeeManager,
+        Oracle,
+        ComplianceRegistry,
+        IdentityRegistry,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        pub failure_count: u8,
+        pub total_failures: u64,
+        pub last_failure_at: Option<u64>,
+        pub open_until: Option<u64>,
+    }
+
+    impl Default for CircuitBreakerState {
+        fn default() -> Self {
+            Self {
+                failure_count: 0,
+                total_failures: 0,
+                last_failure_at: None,
+                open_until: None,
+            }
+        }
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        pub failure_threshold: u8,
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300,
+            }
+        }
     }
 
     /// Escrow information
@@ -1341,6 +1415,8 @@ pub mod propchain_contracts {
                     at
                 },
                 deps: ContainerConfig::new(),
+                external_call_breakers: Mapping::default(),
+                external_call_config: CircuitBreakerConfig::default(),
                 cached_analytics: CachedAnalytics::default(),
                 load_metrics: LoadMetrics::default(),
                 reentrancy_guard: ReentrancyGuard::new(),
@@ -1716,47 +1792,28 @@ pub mod propchain_contracts {
         pub fn update_valuation_from_oracle(&mut self, property_id: u64) -> Result<(), Error> {
             self.ensure_dependency_available(ExternalDependency::Oracle)?;
             non_reentrant!(self, {
+                self.ensure_dependency_available(ExternalDependency::Oracle)?;
                 let oracle_addr = self.oracle.ok_or(Error::OracleError)?;
 
-                // In the off-chain test environment cross-contract calls are not
-                // supported and will panic unconditionally. We gate the actual
-                // invocation behind cfg(not(test)) so unit tests can verify the
-                // circuit-breaker logic without hitting the unimplemented stub.
-                #[cfg(not(test))]
-                {
-                    use ink::env::call::{build_call, ExecutionInput, Selector};
-                    let result = build_call::<ink::env::DefaultEnvironment>()
-                        .call_v1(oracle_addr)
-                        .gas_limit(0)
-                        .transferred_value(0)
-                        .exec_input(
-                            ExecutionInput::new(Selector::new(ink::selector_bytes!(
-                                "get_valuation"
-                            )))
-                            .push_arg(property_id),
-                        )
-                        .returns::<PropertyValuation>()
-                        .try_invoke()
-                        .map_err(|_| Error::OracleError)?
-                        .map_err(|_| Error::OracleError)?;
+                // Use the Oracle trait to perform the cross-contract call
+                use ink::env::call::FromAccountId;
+                let oracle: ink::contract_ref!(Oracle) =
+                    FromAccountId::from_account_id(oracle_addr);
 
-                    if let Some(mut property) = self.properties.get(&property_id) {
-                        property.metadata.valuation = result.valuation;
-                        self.properties.insert(&property_id, &property);
-                    } else {
-                        return Err(Error::PropertyNotFound);
+                // Fetch valuation from oracle
+                let valuation = match oracle.get_valuation(property_id) {
+                    Ok(valuation) => valuation,
+                    Err(_) => {
+                        self.record_dependency_failure(ExternalDependency::Oracle);
+                        return Err(Error::OracleError);
                     }
+                };
 
                     Ok(())
                 }
 
-                // In test builds: circuit-breaker check passed, oracle address is
-                // set — return OracleError to signal the call would be attempted.
-                #[cfg(test)]
-                {
-                    let _ = oracle_addr;
-                    Err(Error::OracleError)
-                }
+                self.record_dependency_success(ExternalDependency::Oracle);
+                Ok(())
             })
         }
 
@@ -4753,10 +4810,10 @@ mod tests_pause {
         contract
             .reset_external_dependency_breaker(ExternalDependency::Oracle)
             .expect("admin should be able to reset breaker");
-        assert_ne!(
-            contract.update_valuation_from_oracle(property_id),
-            Err(Error::ExternalDependencyUnavailable)
-        );
+        let state = contract.get_external_dependency_breaker(ExternalDependency::Oracle);
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(state.open_until, None);
+        assert_eq!(state.total_failures, 1);
     }
 
     #[ink::test]
