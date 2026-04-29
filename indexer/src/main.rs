@@ -4,6 +4,8 @@ mod graphql;
 #[cfg(feature = "ingest")]
 mod ingest;
 mod openapi;
+mod poller;
+mod ws;
 
 use crate::api::{health, list_events, ApiState};
 use crate::openapi::ApiDoc;
@@ -53,6 +55,18 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Arc::new(db);
 
+    // WebSocket broadcast channel for streaming events
+    let ws_state = ws::WsState::new();
+
+    // Spawn DB poller — publishes new events to WebSocket subscribers
+    {
+        let db_clone = db.clone();
+        let ws_clone = ws_state.clone();
+        tokio::spawn(async move {
+            poller::run_poller(db_clone, ws_clone).await;
+        });
+    }
+
     // Start ingestor in background
     #[cfg(feature = "ingest")]
     {
@@ -98,9 +112,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(schema);
 
+    let ws_router = Router::new()
+        .route("/ws/events", get(ws::ws_handler))
+        .with_state(ws_state);
+
     let app = Router::new()
         .merge(rest_router)
         .merge(graphql_router)
+        .merge(ws_router)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(prometheus_layer)
         .layer(cors)

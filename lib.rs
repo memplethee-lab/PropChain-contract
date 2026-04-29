@@ -1,14 +1,18 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol};
 
+
 /// Storage keys for the contract.
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Analytics,
 }
 
+
 /// The core analytics data structure to track loan health.
+
 #[contracttype]
 #[derive(Clone, Default, Debug)]
 pub struct AnalyticsData {

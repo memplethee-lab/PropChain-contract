@@ -105,7 +105,8 @@ pub mod propchain_identity {
         pub did_document: DIDDocument,
         pub reputation_score: u32, // 0-1000 reputation score
         pub verification_level: VerificationLevel,
-        pub trust_score: u32, // Trust score 0-100
+        pub kyc_tier: KycTier, // KYC tier level - Issue #282
+        pub trust_score: u32,  // Trust score 0-100
         pub is_verified: bool,
         pub verified_at: Option<u64>,
         pub verification_expires: Option<u64>,
@@ -210,6 +211,93 @@ pub mod propchain_identity {
         pub expires_at: u64,
     }
 
+    /// KYC Tier structure for tiered verification - Issue #282
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum KycTier {
+        Tier0_Unverified, // No KYC, basic access only
+        Tier1_Basic,      // Basic identity verification
+        Tier2_Standard,   // Standard KYC with document verification
+        Tier3_Enhanced,   // Enhanced due diligence
+        Tier4_Premium,    // Premium verification with full background check
+    }
+
+    /// KYC Tier privileges
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct KycTierPrivileges {
+        pub tier: KycTier,
+        pub max_transaction_value: u128,
+        pub daily_transaction_limit: u64,
+        pub can_trade: bool,
+        pub can_withdraw: bool,
+        pub requires_additional_verification: bool,
+        pub description: [u8; 128],
+    }
+
+    /// Verification Provider - Issue #283
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct VerificationProvider {
+        pub provider_id: AccountId,
+        pub name: [u8; 64],
+        pub provider_type: ProviderType,
+        pub is_active: bool,
+        pub verified_identities: u64,
+        pub registered_at: u64,
+        pub supported_tiers: Vec<KycTier>,
+    }
+
+    /// Provider type classification
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ProviderType {
+        GovernmentId,          // Official government ID verification
+        DocumentVerification,  // Passport, driver's license, etc.
+        BiometricVerification, // Facial recognition, fingerprints
+        FinancialVerification, // Bank account, credit check
+        ThirdPartyKyc,         // Third-party KYC services
+    }
+
+    /// Verification request with provider
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct ProviderVerificationRequest {
+        pub request_id: u64,
+        pub applicant: AccountId,
+        pub provider_id: AccountId,
+        pub requested_tier: KycTier,
+        pub evidence_hash: Option<Hash>,
+        pub requested_at: u64,
+        pub status: VerificationStatus,
+        pub completed_at: Option<u64>,
+        pub result_metadata: [u8; 128],
+    }
+
     /// Risk level assessment
     #[derive(
         Debug,
@@ -302,6 +390,16 @@ pub mod propchain_identity {
         account_audit_count: Mapping<AccountId, u64>,
         /// Revocation records for revoked identities
         revocations: Mapping<AccountId, RevocationRecord>,
+        /// Verification providers - Issue #283
+        verification_providers: Mapping<AccountId, VerificationProvider>,
+        /// Provider verification requests
+        provider_verification_requests: Mapping<u64, ProviderVerificationRequest>,
+        /// Provider request counter
+        provider_request_count: u64,
+        /// KYC tier privileges configuration
+        kyc_tier_privileges: Mapping<KycTier, KycTierPrivileges>,
+        /// User's current KYC tier
+        user_kyc_tiers: Mapping<AccountId, KycTier>,
     }
 
     /// Events
@@ -401,6 +499,44 @@ pub mod propchain_identity {
         timestamp: u64,
     }
 
+    /// Emitted when a KYC verification has expired
+    #[ink(event)]
+    pub struct KycExpired {
+        #[ink(topic)]
+        account: AccountId,
+        expired_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when KYC renewal is required (approaching expiry)
+    #[ink(event)]
+    pub struct KycRenewalRequired {
+        #[ink(topic)]
+        account: AccountId,
+        expires_at: u64,
+        timestamp: u64,
+    }
+
+    /// Emitted when a DID document is updated
+    #[ink(event)]
+    pub struct DIDUpdated {
+        #[ink(topic)]
+        account: AccountId,
+        #[ink(topic)]
+        did: String,
+        version: u32,
+        timestamp: u64,
+    }
+
+    /// Emitted when a ZK KYC proof is verified
+    #[ink(event)]
+    pub struct ZkKycVerified {
+        #[ink(topic)]
+        account: AccountId,
+        proof_type: String,
+        timestamp: u64,
+    }
+
     impl Default for IdentityRegistry {
         fn default() -> Self {
             Self {
@@ -421,6 +557,11 @@ pub mod propchain_identity {
                 account_audit_index: Mapping::default(),
                 account_audit_count: Mapping::default(),
                 revocations: Mapping::default(),
+                verification_providers: Mapping::default(),
+                provider_verification_requests: Mapping::default(),
+                provider_request_count: 0,
+                kyc_tier_privileges: Mapping::default(),
+                user_kyc_tiers: Mapping::default(),
             }
         }
     }
@@ -430,7 +571,7 @@ pub mod propchain_identity {
         #[ink(constructor)]
         pub fn new() -> Self {
             let caller = Self::env().caller();
-            Self {
+            let mut registry = Self {
                 identities: Mapping::default(),
                 did_to_account: Mapping::default(),
                 reputation_metrics: Mapping::default(),
@@ -454,7 +595,17 @@ pub mod propchain_identity {
                 account_audit_index: Mapping::default(),
                 account_audit_count: Mapping::default(),
                 revocations: Mapping::default(),
-            }
+                verification_providers: Mapping::default(),
+                provider_verification_requests: Mapping::default(),
+                provider_request_count: 0,
+                kyc_tier_privileges: Mapping::default(),
+                user_kyc_tiers: Mapping::default(),
+            };
+
+            // Initialize default KYC tier privileges
+            registry.initialize_kyc_tiers();
+
+            registry
         }
 
         /// Create a new identity with DID
@@ -507,6 +658,7 @@ pub mod propchain_identity {
                 did_document,
                 reputation_score: 500, // Start with neutral reputation
                 verification_level: VerificationLevel::None,
+                kyc_tier: KycTier::Tier0_Unverified,
                 trust_score: 50,
                 is_verified: false,
                 verified_at: None,
@@ -1319,6 +1471,314 @@ pub mod propchain_identity {
         pub fn get_supported_chains(&self) -> Vec<ChainId> {
             self.supported_chains.clone()
         }
+
+        // ===== KYC Tier Initialization - Issue #282 =====
+
+        fn initialize_kyc_tiers(&mut self) {
+            let tiers = [
+                KycTierPrivileges {
+                    tier: KycTier::Tier0_Unverified,
+                    max_transaction_value: 1_000_000_000_000_000_000, // 1 token
+                    daily_transaction_limit: 5,
+                    can_trade: false,
+                    can_withdraw: false,
+                    requires_additional_verification: true,
+                    description: Self::pad_description("Unverified - Basic browsing only"),
+                },
+                KycTierPrivileges {
+                    tier: KycTier::Tier1_Basic,
+                    max_transaction_value: 10_000_000_000_000_000_000, // 10 tokens
+                    daily_transaction_limit: 10,
+                    can_trade: true,
+                    can_withdraw: false,
+                    requires_additional_verification: false,
+                    description: Self::pad_description("Basic - Limited transactions"),
+                },
+                KycTierPrivileges {
+                    tier: KycTier::Tier2_Standard,
+                    max_transaction_value: 100_000_000_000_000_000_000, // 100 tokens
+                    daily_transaction_limit: 50,
+                    can_trade: true,
+                    can_withdraw: true,
+                    requires_additional_verification: false,
+                    description: Self::pad_description("Standard - Full trading access"),
+                },
+                KycTierPrivileges {
+                    tier: KycTier::Tier3_Enhanced,
+                    max_transaction_value: 1_000_000_000_000_000_000_000, // 1000 tokens
+                    daily_transaction_limit: 100,
+                    can_trade: true,
+                    can_withdraw: true,
+                    requires_additional_verification: false,
+                    description: Self::pad_description("Enhanced - High value transactions"),
+                },
+                KycTierPrivileges {
+                    tier: KycTier::Tier4_Premium,
+                    max_transaction_value: u128::MAX,
+                    daily_transaction_limit: u64::MAX,
+                    can_trade: true,
+                    can_withdraw: true,
+                    requires_additional_verification: false,
+                    description: Self::pad_description("Premium - Unlimited access"),
+                },
+            ];
+
+            for tier_priv in tiers.iter() {
+                self.kyc_tier_privileges.insert(&tier_priv.tier, tier_priv);
+            }
+        }
+
+        fn pad_description(desc: &str) -> [u8; 128] {
+            let mut result = [0u8; 128];
+            let bytes = desc.as_bytes();
+            let len = bytes.len().min(128);
+            result[..len].copy_from_slice(&bytes[..len]);
+            result
+        }
+
+        // ===== Verification Provider Methods - Issue #283 =====
+
+        #[ink(message)]
+        pub fn register_verification_provider(
+            &mut self,
+            provider_id: AccountId,
+            name: [u8; 64],
+            provider_type: ProviderType,
+            supported_tiers: Vec<KycTier>,
+        ) -> Result<(), IdentityError> {
+            if self.env().caller() != self.admin {
+                return Err(IdentityError::Unauthorized);
+            }
+
+            let now = self.env().block_timestamp();
+            let provider = VerificationProvider {
+                provider_id,
+                name,
+                provider_type,
+                is_active: true,
+                verified_identities: 0,
+                registered_at: now,
+                supported_tiers,
+            };
+
+            self.verification_providers.insert(&provider_id, &provider);
+
+            self.add_audit_entry(
+                provider_id,
+                self.env().caller(),
+                "provider_registered".into(),
+                "Verification provider registered".into(),
+            );
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn deactivate_provider(&mut self, provider_id: AccountId) -> Result<(), IdentityError> {
+            if self.env().caller() != self.admin {
+                return Err(IdentityError::Unauthorized);
+            }
+
+            let mut provider = self
+                .verification_providers
+                .get(&provider_id)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            provider.is_active = false;
+            self.verification_providers.insert(&provider_id, &provider);
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_verification_provider(
+            &self,
+            provider_id: AccountId,
+        ) -> Option<VerificationProvider> {
+            self.verification_providers.get(&provider_id)
+        }
+
+        // ===== KYC Tier Verification - Issue #282 & #283 =====
+
+        #[ink(message)]
+        pub fn request_kyc_verification(
+            &mut self,
+            provider_id: AccountId,
+            requested_tier: KycTier,
+            evidence_hash: Option<Hash>,
+        ) -> Result<u64, IdentityError> {
+            let caller = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+
+            // Verify provider exists and is active
+            let provider = self
+                .verification_providers
+                .get(&provider_id)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            if !provider.is_active {
+                return Err(IdentityError::VerificationFailed);
+            }
+
+            // Verify provider supports the requested tier
+            if !provider.supported_tiers.contains(&requested_tier) {
+                return Err(IdentityError::VerificationFailed);
+            }
+
+            self.provider_request_count += 1;
+            let request_id = self.provider_request_count;
+
+            let request = ProviderVerificationRequest {
+                request_id,
+                applicant: caller,
+                provider_id,
+                requested_tier,
+                evidence_hash,
+                requested_at: timestamp,
+                status: VerificationStatus::Pending,
+                completed_at: None,
+                result_metadata: [0u8; 128],
+            };
+
+            self.provider_verification_requests
+                .insert(&request_id, &request);
+
+            self.add_audit_entry(
+                caller,
+                caller,
+                "kyc_requested".into(),
+                format!("KYC verification requested for tier {:?}", requested_tier),
+            );
+
+            Ok(request_id)
+        }
+
+        #[ink(message)]
+        pub fn complete_kyc_verification(
+            &mut self,
+            request_id: u64,
+            approved: bool,
+            result_metadata: [u8; 128],
+        ) -> Result<(), IdentityError> {
+            let caller = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+
+            // Only authorized providers can complete verification
+            let mut request = self
+                .provider_verification_requests
+                .get(&request_id)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            if request.provider_id != caller {
+                return Err(IdentityError::Unauthorized);
+            }
+
+            if request.status != VerificationStatus::Pending {
+                return Err(IdentityError::VerificationFailed);
+            }
+
+            request.status = if approved {
+                VerificationStatus::Approved
+            } else {
+                VerificationStatus::Rejected
+            };
+            request.completed_at = Some(timestamp);
+            request.result_metadata = result_metadata;
+
+            self.provider_verification_requests
+                .insert(&request_id, &request);
+
+            // If approved, update user's KYC tier
+            if approved {
+                // Update identity
+                if let Some(mut identity) = self.identities.get(&request.applicant) {
+                    identity.kyc_tier = request.requested_tier;
+                    identity.last_activity = timestamp;
+
+                    // Map KYC tier to verification level
+                    identity.verification_level = match request.requested_tier {
+                        KycTier::Tier0_Unverified => VerificationLevel::None,
+                        KycTier::Tier1_Basic => VerificationLevel::Basic,
+                        KycTier::Tier2_Standard => VerificationLevel::Standard,
+                        KycTier::Tier3_Enhanced => VerificationLevel::Enhanced,
+                        KycTier::Tier4_Premium => VerificationLevel::Premium,
+                    };
+
+                    identity.is_verified = true;
+                    identity.verified_at = Some(timestamp);
+
+                    self.identities.insert(&request.applicant, &identity);
+                }
+
+                // Update user's KYC tier mapping
+                self.user_kyc_tiers
+                    .insert(&request.applicant, &request.requested_tier);
+
+                // Update provider's verified count
+                if let Some(mut provider) = self.verification_providers.get(&request.provider_id) {
+                    provider.verified_identities += 1;
+                    self.verification_providers
+                        .insert(&request.provider_id, &provider);
+                }
+
+                self.add_audit_entry(
+                    request.applicant,
+                    caller,
+                    "kyc_approved".into(),
+                    format!("KYC approved for tier {:?}", request.requested_tier),
+                );
+            } else {
+                self.add_audit_entry(
+                    request.applicant,
+                    caller,
+                    "kyc_rejected".into(),
+                    "KYC verification rejected".into(),
+                );
+            }
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_user_kyc_tier(&self, account: AccountId) -> Option<KycTier> {
+            self.user_kyc_tiers.get(&account)
+        }
+
+        #[ink(message)]
+        pub fn get_kyc_tier_privileges(&self, tier: KycTier) -> Option<KycTierPrivileges> {
+            self.kyc_tier_privileges.get(&tier)
+        }
+
+        #[ink(message)]
+        pub fn get_provider_verification_request(
+            &self,
+            request_id: u64,
+        ) -> Option<ProviderVerificationRequest> {
+            self.provider_verification_requests.get(&request_id)
+        }
+
+        #[ink(message)]
+        pub fn check_tier_privileges(
+            &self,
+            account: AccountId,
+            transaction_value: u128,
+        ) -> Result<bool, IdentityError> {
+            let tier = self
+                .user_kyc_tiers
+                .get(&account)
+                .unwrap_or(KycTier::Tier0_Unverified);
+
+            let privileges = self
+                .kyc_tier_privileges
+                .get(&tier)
+                .ok_or(IdentityError::IdentityNotFound)?;
+
+            if transaction_value > privileges.max_transaction_value {
+                return Ok(false);
+            }
+
+            Ok(privileges.can_trade)
+        }
     }
 
     #[cfg(test)]
@@ -1429,6 +1889,147 @@ pub mod propchain_identity {
                 reg.revoke_identity(accounts.alice, "Unauthorized".into()),
                 Err(IdentityError::Unauthorized)
             );
+        }
+
+        #[ink::test]
+        fn test_kyc_tier_privileges_initialized() {
+            let reg = default_registry();
+
+            // Check that KYC tiers are initialized
+            let tier0 = reg.get_kyc_tier_privileges(KycTier::Tier0_Unverified);
+            assert!(tier0.is_some());
+            assert!(!tier0.unwrap().can_trade);
+
+            let tier2 = reg.get_kyc_tier_privileges(KycTier::Tier2_Standard);
+            assert!(tier2.is_some());
+            let tier2 = tier2.unwrap();
+            assert!(tier2.can_trade);
+            assert!(tier2.can_withdraw);
+        }
+
+        #[ink::test]
+        fn test_register_verification_provider() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let provider_id = accounts.bob;
+
+            let name = [0x50u8; 64];
+            let supported_tiers = vec![KycTier::Tier1_Basic, KycTier::Tier2_Standard];
+
+            reg.register_verification_provider(
+                provider_id,
+                name,
+                ProviderType::DocumentVerification,
+                supported_tiers.clone(),
+            )
+            .unwrap();
+
+            let provider = reg.get_verification_provider(provider_id);
+            assert!(provider.is_some());
+            let provider = provider.unwrap();
+            assert!(provider.is_active);
+            assert_eq!(provider.supported_tiers, supported_tiers);
+            assert_eq!(provider.provider_type, ProviderType::DocumentVerification);
+        }
+
+        #[ink::test]
+        fn test_kyc_verification_flow() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            // Create identity as bob
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
+            reg.create_identity(
+                "did:test:kyc1".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+
+            // Register a provider as admin
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
+            let provider_id = accounts.charlie;
+            reg.register_verification_provider(
+                provider_id,
+                [0x51u8; 64],
+                ProviderType::GovernmentId,
+                vec![KycTier::Tier1_Basic, KycTier::Tier2_Standard],
+            )
+            .unwrap();
+
+            // Bob requests KYC verification
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
+            let request_id = reg
+                .request_kyc_verification(provider_id, KycTier::Tier2_Standard, Some([0xAB; 32]))
+                .unwrap();
+
+            assert_eq!(request_id, 1);
+
+            // Provider completes verification (as charlie)
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);
+            reg.complete_kyc_verification(request_id, true, [0xCD; 128])
+                .unwrap();
+
+            // Check Bob's KYC tier was updated
+            let bob_tier = reg.get_user_kyc_tier(accounts.bob);
+            assert!(bob_tier.is_some());
+            assert_eq!(bob_tier.unwrap(), KycTier::Tier2_Standard);
+
+            // Check Bob's identity was updated
+            let bob_identity = reg.get_identity(accounts.bob).unwrap();
+            assert_eq!(bob_identity.kyc_tier, KycTier::Tier2_Standard);
+            assert_eq!(bob_identity.verification_level, VerificationLevel::Standard);
+        }
+
+        #[ink::test]
+        fn test_check_tier_privileges() {
+            let mut reg = default_registry();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            // Create identity and get Tier2
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
+            reg.create_identity(
+                "did:test:tier1".into(),
+                vec![1u8; 32],
+                "Ed25519".into(),
+                None,
+                make_privacy(),
+            )
+            .unwrap();
+
+            // Register provider and complete KYC
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
+            reg.register_verification_provider(
+                accounts.charlie,
+                [0x52u8; 64],
+                ProviderType::FinancialVerification,
+                vec![KycTier::Tier3_Enhanced],
+            )
+            .unwrap();
+
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
+            let request_id = reg
+                .request_kyc_verification(accounts.charlie, KycTier::Tier3_Enhanced, None)
+                .unwrap();
+
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);
+            reg.complete_kyc_verification(request_id, true, [0u8; 128])
+                .unwrap();
+
+            // Check privileges
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
+            let can_trade = reg
+                .check_tier_privileges(accounts.bob, 500_000_000_000_000_000_000)
+                .unwrap();
+            assert!(can_trade);
+
+            // Unverified user should have limited privileges
+            let unverified_can_trade = reg
+                .check_tier_privileges(accounts.dave, 1_000_000_000_000_000_000)
+                .unwrap();
+            assert!(!unverified_can_trade);
         }
     }
 }

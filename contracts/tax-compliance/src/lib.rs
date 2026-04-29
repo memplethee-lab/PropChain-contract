@@ -303,6 +303,92 @@ mod tax_compliance {
         reporting_submitted: bool,
     }
 
+    #[ink(event)]
+    pub struct TaxDocumentUploaded {
+        #[ink(topic)]
+        property_id: u64,
+        #[ink(topic)]
+        jurisdiction_code: u32,
+        reporting_period: u64,
+        document_index: u64,
+        document_type: DocumentType,
+        ipfs_hash: [u8; 32],
+        uploaded_by: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct TaxDocumentVerified {
+        #[ink(topic)]
+        property_id: u64,
+        #[ink(topic)]
+        jurisdiction_code: u32,
+        reporting_period: u64,
+        document_index: u64,
+        verified_by: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct TaxAdvisorRegistered {
+        #[ink(topic)]
+        advisor_id: AccountId,
+        license_number: [u8; 32],
+        jurisdiction_codes: Vec<u32>,
+    }
+
+    #[ink(event)]
+    pub struct TaxAdvisorAssigned {
+        #[ink(topic)]
+        advisor_id: AccountId,
+        #[ink(topic)]
+        property_id: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct TaxDocument {
+        pub property_id: u64,
+        pub jurisdiction_code: u32,
+        pub reporting_period: u64,
+        pub document_type: DocumentType,
+        pub ipfs_hash: [u8; 32],
+        pub uploaded_by: AccountId,
+        pub uploaded_at: Timestamp,
+        pub verified: bool,
+        pub verified_by: Option<AccountId>,
+        pub verified_at: Option<Timestamp>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum DocumentType {
+        TaxReturn,
+        PaymentReceipt,
+        AssessmentReport,
+        ExemptionCertificate,
+        ComplianceReport,
+        Other,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct TaxAdvisor {
+        pub advisor_id: AccountId,
+        pub name: [u8; 64],
+        pub license_number: [u8; 32],
+        pub jurisdiction_codes: Vec<u32>,
+        pub is_active: bool,
+        pub registered_at: Timestamp,
+    }
+
     #[ink(storage)]
     pub struct TaxComplianceModule {
         admin: AccountId,
@@ -315,6 +401,10 @@ mod tax_compliance {
         latest_reporting_period: Mapping<(u64, u32), u64>,
         audit_logs: Mapping<(u64, u64), AuditEntry>,
         audit_log_count: Mapping<u64, u64>,
+        tax_documents: Mapping<(u64, u32, u64, u64), TaxDocument>,
+        tax_document_count: Mapping<(u64, u32, u64), u64>,
+        tax_advisors: Mapping<AccountId, TaxAdvisor>,
+        advisor_property_assignments: Mapping<(AccountId, u64), bool>,
     }
 
     impl TaxComplianceModule {
@@ -330,6 +420,10 @@ mod tax_compliance {
                 latest_reporting_period: Mapping::default(),
                 audit_logs: Mapping::default(),
                 audit_log_count: Mapping::default(),
+                tax_documents: Mapping::default(),
+                tax_document_count: Mapping::default(),
+                tax_advisors: Mapping::default(),
+                advisor_property_assignments: Mapping::default(),
             }
         }
 
@@ -856,6 +950,280 @@ mod tax_compliance {
             self.audit_logs.insert((property_id, count), &entry);
             self.audit_log_count.insert(property_id, &(count + 1));
         }
+
+        // ===== Tax Document Storage (IPFS) - Issue #264 =====
+
+        #[ink(message)]
+        pub fn upload_tax_document(
+            &mut self,
+            property_id: u64,
+            jurisdiction_code: u32,
+            reporting_period: u64,
+            document_type: DocumentType,
+            ipfs_hash: [u8; 32],
+        ) -> Result<()> {
+            non_reentrant!(self, {
+                self.ensure_admin()?;
+                let now = self.env().block_timestamp();
+                let caller = self.env().caller();
+
+                let count = self
+                    .tax_document_count
+                    .get((property_id, jurisdiction_code, reporting_period))
+                    .unwrap_or(0);
+
+                let document = TaxDocument {
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_type,
+                    ipfs_hash,
+                    uploaded_by: caller,
+                    uploaded_at: now,
+                    verified: false,
+                    verified_by: None,
+                    verified_at: None,
+                };
+
+                self.tax_documents.insert(
+                    (property_id, jurisdiction_code, reporting_period, count),
+                    &document,
+                );
+                self.tax_document_count.insert(
+                    (property_id, jurisdiction_code, reporting_period),
+                    &(count + 1),
+                );
+
+                self.env().emit_event(TaxDocumentUploaded {
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_index: count,
+                    document_type,
+                    ipfs_hash,
+                    uploaded_by: caller,
+                });
+
+                self.log_audit(
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    AuditAction::LegalDocumentUpdated,
+                    0,
+                    ipfs_hash,
+                );
+
+                Ok(())
+            })
+        }
+
+        #[ink(message)]
+        pub fn verify_tax_document(
+            &mut self,
+            property_id: u64,
+            jurisdiction_code: u32,
+            reporting_period: u64,
+            document_index: u64,
+        ) -> Result<()> {
+            non_reentrant!(self, {
+                self.ensure_admin()?;
+                let now = self.env().block_timestamp();
+                let caller = self.env().caller();
+
+                let key = (
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_index,
+                );
+                let mut document = self.tax_documents.get(key).ok_or(Error::RecordNotFound)?;
+
+                document.verified = true;
+                document.verified_by = Some(caller);
+                document.verified_at = Some(now);
+
+                self.tax_documents.insert(key, &document);
+
+                self.env().emit_event(TaxDocumentVerified {
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_index,
+                    verified_by: caller,
+                });
+
+                self.log_audit(
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    AuditAction::LegalDocumentUpdated,
+                    0,
+                    document.ipfs_hash,
+                );
+
+                Ok(())
+            })
+        }
+
+        #[ink(message)]
+        pub fn get_tax_documents(
+            &self,
+            property_id: u64,
+            jurisdiction_code: u32,
+            reporting_period: u64,
+        ) -> Vec<TaxDocument> {
+            let count = self
+                .tax_document_count
+                .get((property_id, jurisdiction_code, reporting_period))
+                .unwrap_or(0);
+            let mut documents = Vec::new();
+            for i in 0..count {
+                if let Some(doc) =
+                    self.tax_documents
+                        .get((property_id, jurisdiction_code, reporting_period, i))
+                {
+                    documents.push(doc);
+                }
+            }
+            documents
+        }
+
+        #[ink(message)]
+        pub fn get_tax_document(
+            &self,
+            property_id: u64,
+            jurisdiction_code: u32,
+            reporting_period: u64,
+            document_index: u64,
+        ) -> Option<TaxDocument> {
+            self.tax_documents.get((
+                property_id,
+                jurisdiction_code,
+                reporting_period,
+                document_index,
+            ))
+        }
+
+        // ===== Tax Advisor Integration - Issue #265 =====
+
+        #[ink(message)]
+        pub fn register_tax_advisor(
+            &mut self,
+            advisor_id: AccountId,
+            name: [u8; 64],
+            license_number: [u8; 32],
+            jurisdiction_codes: Vec<u32>,
+        ) -> Result<()> {
+            self.ensure_admin()?;
+            let now = self.env().block_timestamp();
+
+            let advisor = TaxAdvisor {
+                advisor_id,
+                name,
+                license_number,
+                jurisdiction_codes,
+                is_active: true,
+                registered_at: now,
+            };
+
+            self.tax_advisors.insert(&advisor_id, &advisor);
+
+            self.env().emit_event(TaxAdvisorRegistered {
+                advisor_id,
+                license_number,
+                jurisdiction_codes,
+            });
+
+            self.log_audit(0, 0, 0, AuditAction::RuleConfigured, 0, license_number);
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn deactivate_tax_advisor(&mut self, advisor_id: AccountId) -> Result<()> {
+            self.ensure_admin()?;
+
+            let mut advisor = self
+                .tax_advisors
+                .get(&advisor_id)
+                .ok_or(Error::Unauthorized)?;
+
+            advisor.is_active = false;
+            self.tax_advisors.insert(&advisor_id, &advisor);
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn assign_advisor_to_property(
+            &mut self,
+            advisor_id: AccountId,
+            property_id: u64,
+        ) -> Result<()> {
+            self.ensure_admin()?;
+
+            let advisor = self
+                .tax_advisors
+                .get(&advisor_id)
+                .ok_or(Error::Unauthorized)?;
+
+            if !advisor.is_active {
+                return Err(Error::InactiveRule);
+            }
+
+            self.advisor_property_assignments
+                .insert((&advisor_id, property_id), &true);
+
+            self.env().emit_event(TaxAdvisorAssigned {
+                advisor_id,
+                property_id,
+            });
+
+            self.log_audit(
+                property_id,
+                0,
+                0,
+                AuditAction::AssessmentUpdated,
+                0,
+                [0u8; 32],
+            );
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn remove_advisor_from_property(
+            &mut self,
+            advisor_id: AccountId,
+            property_id: u64,
+        ) -> Result<()> {
+            self.ensure_admin()?;
+
+            self.advisor_property_assignments
+                .insert((&advisor_id, property_id), &false);
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn get_tax_advisor(&self, advisor_id: AccountId) -> Option<TaxAdvisor> {
+            self.tax_advisors.get(&advisor_id)
+        }
+
+        #[ink(message)]
+        pub fn is_advisor_assigned(&self, advisor_id: AccountId, property_id: u64) -> bool {
+            self.advisor_property_assignments
+                .get((&advisor_id, property_id))
+                .unwrap_or(false)
+        }
+
+        #[ink(message)]
+        pub fn get_property_advisors(&self, property_id: u64) -> Vec<TaxAdvisor> {
+            let mut advisors = Vec::new();
+            // Note: In production, you'd want to maintain an index of advisor_ids
+            // For now, this is a placeholder that would need iteration optimization
+            advisors
+        }
     }
 
     #[cfg(test)]
@@ -974,6 +1342,77 @@ mod tax_compliance {
             assert_eq!(logs[0].action, AuditAction::AssessmentUpdated);
             assert_eq!(logs[1].action, AuditAction::TaxCalculated);
             assert_eq!(logs[2].action, AuditAction::TaxPaid);
+        }
+
+        #[ink::test]
+        fn test_upload_and_verify_tax_document() {
+            let mut contract = TaxComplianceModule::new(None);
+            let owner = AccountId::from([0x05; 32]);
+
+            contract
+                .configure_tax_rule(jurisdiction(), rule())
+                .expect("rule");
+            contract
+                .set_property_assessment(10, jurisdiction(), owner, 150_000, 0)
+                .expect("assessment");
+
+            // Upload a tax document
+            let ipfs_hash = [0xAB; 32];
+            contract
+                .upload_tax_document(10, 1001, 0, DocumentType::TaxReturn, ipfs_hash)
+                .expect("upload");
+
+            // Verify document was uploaded
+            let documents = contract.get_tax_documents(10, 1001, 0);
+            assert_eq!(documents.len(), 1);
+            assert_eq!(documents[0].ipfs_hash, ipfs_hash);
+            assert_eq!(documents[0].document_type, DocumentType::TaxReturn);
+            assert!(!documents[0].verified);
+
+            // Verify the document
+            contract
+                .verify_tax_document(10, 1001, 0, 0)
+                .expect("verify");
+
+            let documents = contract.get_tax_documents(10, 1001, 0);
+            assert!(documents[0].verified);
+            assert!(documents[0].verified_by.is_some());
+        }
+
+        #[ink::test]
+        fn test_register_and_assign_tax_advisor() {
+            let mut contract = TaxComplianceModule::new(None);
+            let advisor_id = AccountId::from([0x06; 32]);
+
+            // Register a tax advisor
+            let name = [0x41; 64];
+            let license = [0x42; 32];
+            let jurisdictions = vec![1001, 1002];
+
+            contract
+                .register_tax_advisor(advisor_id, name, license, jurisdictions.clone())
+                .expect("register");
+
+            // Verify advisor was registered
+            let advisor = contract.get_tax_advisor(advisor_id);
+            assert!(advisor.is_some());
+            let advisor = advisor.unwrap();
+            assert!(advisor.is_active);
+            assert_eq!(advisor.jurisdiction_codes, jurisdictions);
+
+            // Assign advisor to property
+            contract
+                .assign_advisor_to_property(advisor_id, 15)
+                .expect("assign");
+
+            assert!(contract.is_advisor_assigned(advisor_id, 15));
+
+            // Remove advisor from property
+            contract
+                .remove_advisor_from_property(advisor_id, 15)
+                .expect("remove");
+
+            assert!(!contract.is_advisor_assigned(advisor_id, 15));
         }
     }
 }
