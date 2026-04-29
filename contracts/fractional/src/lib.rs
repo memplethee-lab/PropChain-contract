@@ -70,7 +70,8 @@ mod fractional {
         pub price_per_share: u128,
     }
 
-    /// Per-token performance metrics for fractional ownership analytics.
+    /// AMM liquidity pool for a property token using constant-product (x * y = k).
+    /// `share_reserve` = shares in pool, `value_reserve` = native-token value in pool.
     #[derive(
         Debug,
         Clone,
@@ -81,17 +82,10 @@ mod fractional {
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-    pub struct FractionalMetrics {
-        /// Number of completed share trades (buy_shares + swap_shares_for_value).
-        pub trade_count: u64,
-        /// Cumulative value exchanged across all trades.
-        pub total_volume: u128,
-        /// Number of distinct accounts that currently hold shares.
-        pub unique_holders: u64,
-        /// Highest price-per-share ever recorded for this token.
-        pub all_time_high_price: u128,
-        /// Lowest non-zero price-per-share ever recorded for this token.
-        pub all_time_low_price: u128,
+    pub struct AmmPool {
+        pub share_reserve: u128,
+        pub value_reserve: u128,
+        pub lp_supply: u128,
     }
 
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
@@ -102,6 +96,11 @@ mod fractional {
         InsufficientPayment,
         Unauthorized,
         ZeroAmount,
+        PoolNotFound,
+        PoolAlreadyExists,
+        SlippageExceeded,
+        InsufficientLiquidity,
+        InsufficientLpShares,
     }
 
     /// Emitted when an owner lists shares for sale
@@ -144,6 +143,39 @@ mod fractional {
         token_id: u64,
     }
 
+    /// Emitted when liquidity is added to an AMM pool
+    #[ink(event)]
+    pub struct LiquidityAdded {
+        #[ink(topic)]
+        provider: AccountId,
+        token_id: u64,
+        shares_added: u128,
+        value_added: u128,
+        lp_minted: u128,
+    }
+
+    /// Emitted when liquidity is removed from an AMM pool
+    #[ink(event)]
+    pub struct LiquidityRemoved {
+        #[ink(topic)]
+        provider: AccountId,
+        token_id: u64,
+        shares_out: u128,
+        value_out: u128,
+        lp_burned: u128,
+    }
+
+    /// Emitted when shares are swapped for value via the AMM
+    #[ink(event)]
+    pub struct SharesSwapped {
+        #[ink(topic)]
+        trader: AccountId,
+        token_id: u64,
+        shares_in: u128,
+        value_out: u128,
+        new_spot_price: u128,
+    }
+
     #[ink(storage)]
     pub struct Fractional {
         last_prices: Mapping<u64, u128>,
@@ -153,10 +185,10 @@ mod fractional {
         listings: Mapping<(AccountId, u64), ShareListing>,
         /// Total shares issued per token_id
         total_shares: Mapping<u64, u128>,
-        /// Performance metrics per token_id
-        token_metrics: Mapping<u64, FractionalMetrics>,
-        /// Tracks whether an account currently holds shares (for unique_holders count)
-        is_holder: Mapping<(AccountId, u64), bool>,
+        /// AMM pools per token_id
+        amm_pools: Mapping<u64, AmmPool>,
+        /// LP token balances per (provider, token_id)
+        lp_balances: Mapping<(AccountId, u64), u128>,
     }
 
     impl Fractional {
@@ -167,8 +199,8 @@ mod fractional {
                 balances: Mapping::default(),
                 listings: Mapping::default(),
                 total_shares: Mapping::default(),
-                token_metrics: Mapping::default(),
-                is_holder: Mapping::default(),
+                amm_pools: Mapping::default(),
+                lp_balances: Mapping::default(),
             }
         }
     }
@@ -237,11 +269,11 @@ mod fractional {
         #[ink(message)]
         pub fn mint_shares(&mut self, owner: AccountId, token_id: u64, amount: u128) {
             let current = self.balances.get(&(owner, token_id)).unwrap_or(0);
-            let new_bal = current.saturating_add(amount);
-            self.balances.insert(&(owner, token_id), &new_bal);
+            self.balances
+                .insert(&(owner, token_id), &current.saturating_add(amount));
             let total = self.total_shares.get(&token_id).unwrap_or(0);
-            self.total_shares.insert(&token_id, &total.saturating_add(amount));
-            self.update_holder(owner, token_id, new_bal);
+            self.total_shares
+                .insert(&token_id, &total.saturating_add(amount));
         }
 
         /// Get the share balance of an owner for a given token
@@ -426,55 +458,285 @@ mod fractional {
             self.listings.get(&(seller, token_id))
         }
 
-        // ── Issue #273: Fractional ownership analytics ───────────────────────
+        // ── Issue #269: AMM-style dynamic share pricing ──────────────────────
 
-        /// Returns the performance metrics for `token_id`.
+        /// Seed a new constant-product AMM pool for `token_id`.
+        /// The caller contributes `share_amount` shares and attaches native value.
+        /// Caller must already hold `share_amount` shares.
+        #[ink(message, payable)]
+        pub fn add_liquidity(
+            &mut self,
+            token_id: u64,
+            share_amount: u128,
+            min_lp_out: u128,
+        ) -> Result<u128, FractionalError> {
+            if share_amount == 0 {
+                return Err(FractionalError::ZeroAmount);
+            }
+            let caller = self.env().caller();
+            let value_in = self.env().transferred_value();
+            if value_in == 0 {
+                return Err(FractionalError::ZeroAmount);
+            }
+
+            let held = self.balances.get(&(caller, token_id)).unwrap_or(0);
+            if held < share_amount {
+                return Err(FractionalError::InsufficientShares);
+            }
+
+            let lp_minted;
+            let pool = self.amm_pools.get(token_id);
+            let updated = match pool {
+                None => {
+                    // First deposit: LP = sqrt(share_amount * value_in), floored via integer sqrt
+                    lp_minted = Self::isqrt(share_amount.saturating_mul(value_in));
+                    AmmPool {
+                        share_reserve: share_amount,
+                        value_reserve: value_in,
+                        lp_supply: lp_minted,
+                    }
+                }
+                Some(p) => {
+                    // Proportional deposit: LP = min(share/share_reserve, value/value_reserve) * lp_supply
+                    let lp_by_share = share_amount
+                        .saturating_mul(p.lp_supply)
+                        .checked_div(p.share_reserve)
+                        .unwrap_or(0);
+                    let lp_by_value = value_in
+                        .saturating_mul(p.lp_supply)
+                        .checked_div(p.value_reserve)
+                        .unwrap_or(0);
+                    lp_minted = lp_by_share.min(lp_by_value);
+                    AmmPool {
+                        share_reserve: p.share_reserve.saturating_add(share_amount),
+                        value_reserve: p.value_reserve.saturating_add(value_in),
+                        lp_supply: p.lp_supply.saturating_add(lp_minted),
+                    }
+                }
+            };
+
+            if lp_minted < min_lp_out {
+                return Err(FractionalError::SlippageExceeded);
+            }
+
+            // Lock shares in pool (deduct from caller balance)
+            self.balances
+                .insert(&(caller, token_id), &held.saturating_sub(share_amount));
+
+            // Update spot price
+            if updated.share_reserve > 0 {
+                let spot = updated.value_reserve / updated.share_reserve;
+                self.last_prices.insert(token_id, &spot);
+            }
+
+            self.amm_pools.insert(token_id, &updated);
+            let lp_held = self.lp_balances.get(&(caller, token_id)).unwrap_or(0);
+            self.lp_balances
+                .insert(&(caller, token_id), &lp_held.saturating_add(lp_minted));
+
+            self.env().emit_event(LiquidityAdded {
+                provider: caller,
+                token_id,
+                shares_added: share_amount,
+                value_added: value_in,
+                lp_minted,
+            });
+            Ok(lp_minted)
+        }
+
+        /// Burn `lp_amount` LP tokens and withdraw proportional shares + value.
         #[ink(message)]
-        pub fn get_metrics(&self, token_id: u64) -> FractionalMetrics {
-            self.token_metrics.get(token_id).unwrap_or(FractionalMetrics {
-                trade_count: 0,
-                total_volume: 0,
-                unique_holders: 0,
-                all_time_high_price: 0,
-                all_time_low_price: 0,
-            })
+        pub fn remove_liquidity(
+            &mut self,
+            token_id: u64,
+            lp_amount: u128,
+            min_shares_out: u128,
+            min_value_out: u128,
+        ) -> Result<(u128, u128), FractionalError> {
+            if lp_amount == 0 {
+                return Err(FractionalError::ZeroAmount);
+            }
+            let caller = self.env().caller();
+            let lp_held = self.lp_balances.get(&(caller, token_id)).unwrap_or(0);
+            if lp_held < lp_amount {
+                return Err(FractionalError::InsufficientLpShares);
+            }
+            let pool = self
+                .amm_pools
+                .get(token_id)
+                .ok_or(FractionalError::PoolNotFound)?;
+
+            let shares_out = lp_amount
+                .saturating_mul(pool.share_reserve)
+                .checked_div(pool.lp_supply)
+                .unwrap_or(0);
+            let value_out = lp_amount
+                .saturating_mul(pool.value_reserve)
+                .checked_div(pool.lp_supply)
+                .unwrap_or(0);
+
+            if shares_out < min_shares_out || value_out < min_value_out {
+                return Err(FractionalError::SlippageExceeded);
+            }
+
+            let updated = AmmPool {
+                share_reserve: pool.share_reserve.saturating_sub(shares_out),
+                value_reserve: pool.value_reserve.saturating_sub(value_out),
+                lp_supply: pool.lp_supply.saturating_sub(lp_amount),
+            };
+
+            // Return shares to caller
+            let bal = self.balances.get(&(caller, token_id)).unwrap_or(0);
+            self.balances
+                .insert(&(caller, token_id), &bal.saturating_add(shares_out));
+
+            self.lp_balances
+                .insert(&(caller, token_id), &lp_held.saturating_sub(lp_amount));
+            self.amm_pools.insert(token_id, &updated);
+
+            // Update spot price
+            if updated.share_reserve > 0 {
+                let spot = updated.value_reserve / updated.share_reserve;
+                self.last_prices.insert(token_id, &spot);
+            }
+
+            // Return value to caller (best-effort)
+            if value_out > 0 {
+                let _ = self.env().transfer(caller, value_out);
+            }
+
+            self.env().emit_event(LiquidityRemoved {
+                provider: caller,
+                token_id,
+                shares_out,
+                value_out,
+                lp_burned: lp_amount,
+            });
+            Ok((shares_out, value_out))
         }
 
-        // ── Private analytics helpers ─────────────────────────────────────────
-
-        /// Record a completed trade: increment trade_count, add to total_volume,
-        /// and update all-time high/low price.
-        fn record_trade(&mut self, token_id: u64, volume: u128, price_per_share: u128) {
-            let mut m = self.get_metrics(token_id);
-            m.trade_count = m.trade_count.saturating_add(1);
-            m.total_volume = m.total_volume.saturating_add(volume);
-            if price_per_share > 0 {
-                if price_per_share > m.all_time_high_price {
-                    m.all_time_high_price = price_per_share;
-                }
-                if m.all_time_low_price == 0 || price_per_share < m.all_time_low_price {
-                    m.all_time_low_price = price_per_share;
-                }
+        /// Sell `shares_in` shares into the AMM pool, receiving native value out.
+        /// Uses constant-product formula: value_out = value_reserve - k / (share_reserve + shares_in).
+        /// A 30-bip (0.3 %) fee is retained in the pool.
+        #[ink(message)]
+        pub fn swap_shares_for_value(
+            &mut self,
+            token_id: u64,
+            shares_in: u128,
+            min_value_out: u128,
+        ) -> Result<u128, FractionalError> {
+            if shares_in == 0 {
+                return Err(FractionalError::ZeroAmount);
             }
-            self.token_metrics.insert(token_id, &m);
-        }
-
-        /// Update the unique_holders count when an account's balance crosses zero.
-        /// `new_balance` is the balance *after* the transfer.
-        fn update_holder(&mut self, account: AccountId, token_id: u64, new_balance: u128) {
-            let was_holder = self.is_holder.get(&(account, token_id)).unwrap_or(false);
-            let now_holder = new_balance > 0;
-            if was_holder == now_holder {
-                return;
+            let caller = self.env().caller();
+            let held = self.balances.get(&(caller, token_id)).unwrap_or(0);
+            if held < shares_in {
+                return Err(FractionalError::InsufficientShares);
             }
-            self.is_holder.insert(&(account, token_id), &now_holder);
-            let mut m = self.get_metrics(token_id);
-            if now_holder {
-                m.unique_holders = m.unique_holders.saturating_add(1);
+            let pool = self
+                .amm_pools
+                .get(token_id)
+                .ok_or(FractionalError::PoolNotFound)?;
+            if pool.value_reserve == 0 || pool.share_reserve == 0 {
+                return Err(FractionalError::InsufficientLiquidity);
+            }
+
+            // 0.3 % fee: effective shares_in after fee
+            let shares_in_with_fee = shares_in.saturating_mul(9970);
+            let numerator = shares_in_with_fee.saturating_mul(pool.value_reserve);
+            let denominator = pool
+                .share_reserve
+                .saturating_mul(10000)
+                .saturating_add(shares_in_with_fee);
+            let value_out = numerator.checked_div(denominator).unwrap_or(0);
+
+            if value_out < min_value_out {
+                return Err(FractionalError::SlippageExceeded);
+            }
+            if value_out >= pool.value_reserve {
+                return Err(FractionalError::InsufficientLiquidity);
+            }
+
+            let updated = AmmPool {
+                share_reserve: pool.share_reserve.saturating_add(shares_in),
+                value_reserve: pool.value_reserve.saturating_sub(value_out),
+                lp_supply: pool.lp_supply,
+            };
+
+            // Deduct shares from caller
+            self.balances
+                .insert(&(caller, token_id), &held.saturating_sub(shares_in));
+            // Burn shares from total supply
+            let total = self.total_shares.get(token_id).unwrap_or(0);
+            self.total_shares
+                .insert(token_id, &total.saturating_sub(shares_in));
+
+            // Update spot price
+            let new_spot = if updated.share_reserve > 0 {
+                let s = updated.value_reserve / updated.share_reserve;
+                self.last_prices.insert(token_id, &s);
+                s
             } else {
-                m.unique_holders = m.unique_holders.saturating_sub(1);
+                0
+            };
+
+            self.amm_pools.insert(token_id, &updated);
+
+            // Pay caller (best-effort)
+            if value_out > 0 {
+                let _ = self.env().transfer(caller, value_out);
             }
-            self.token_metrics.insert(token_id, &m);
+
+            self.env().emit_event(SharesSwapped {
+                trader: caller,
+                token_id,
+                shares_in,
+                value_out,
+                new_spot_price: new_spot,
+            });
+            Ok(value_out)
+        }
+
+        /// Returns the current spot price (value per share) for `token_id`'s AMM pool.
+        /// Spot price = value_reserve / share_reserve.
+        #[ink(message)]
+        pub fn get_spot_price(&self, token_id: u64) -> Result<u128, FractionalError> {
+            let pool = self
+                .amm_pools
+                .get(token_id)
+                .ok_or(FractionalError::PoolNotFound)?;
+            if pool.share_reserve == 0 {
+                return Err(FractionalError::InsufficientLiquidity);
+            }
+            Ok(pool.value_reserve / pool.share_reserve)
+        }
+
+        /// Returns the AMM pool state for `token_id`.
+        #[ink(message)]
+        pub fn get_pool(&self, token_id: u64) -> Option<AmmPool> {
+            self.amm_pools.get(token_id)
+        }
+
+        /// Returns the LP token balance of `provider` for `token_id`.
+        #[ink(message)]
+        pub fn lp_balance_of(&self, provider: AccountId, token_id: u64) -> u128 {
+            self.lp_balances.get(&(provider, token_id)).unwrap_or(0)
+        }
+
+        // ── Helpers ──────────────────────────────────────────────────────────
+
+        /// Integer square root (floor).
+        fn isqrt(n: u128) -> u128 {
+            if n == 0 {
+                return 0;
+            }
+            let mut x = n;
+            let mut y = (x + 1) / 2;
+            while y < x {
+                x = y;
+                y = (x + n / x) / 2;
+            }
+            x
         }
     }
 
@@ -546,8 +808,16 @@ mod fractional {
         fn test_aggregate_portfolio() {
             let f = Fractional::new();
             let items = vec![
-                PortfolioItem { token_id: 1, shares: 10, price_per_share: 5 },
-                PortfolioItem { token_id: 2, shares: 20, price_per_share: 3 },
+                PortfolioItem {
+                    token_id: 1,
+                    shares: 10,
+                    price_per_share: 5,
+                },
+                PortfolioItem {
+                    token_id: 2,
+                    shares: 20,
+                    price_per_share: 3,
+                },
             ];
             let agg = f.aggregate_portfolio(items);
             assert_eq!(agg.total_value, 110);
@@ -568,95 +838,161 @@ mod fractional {
             );
         }
 
-        // ── Analytics tests (#273) ────────────────────────────────────────────
+        // ── AMM tests ────────────────────────────────────────────────────────
 
         #[ink::test]
-        fn test_metrics_default_zero() {
+        fn test_add_liquidity_creates_pool() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(500);
+            let lp = f.add_liquidity(1, 100, 0).unwrap();
+            assert!(lp > 0);
+
+            let pool = f.get_pool(1).unwrap();
+            assert_eq!(pool.share_reserve, 100);
+            assert_eq!(pool.value_reserve, 500);
+            assert_eq!(pool.lp_supply, lp);
+            assert_eq!(f.lp_balance_of(alice(), 1), lp);
+            // Shares locked: 1000 - 100 = 900
+            assert_eq!(f.balance_of(alice(), 1), 900);
+        }
+
+        #[ink::test]
+        fn test_add_liquidity_updates_spot_price() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(2000);
+            f.add_liquidity(1, 100, 0).unwrap();
+
+            // spot = 2000 / 100 = 20
+            assert_eq!(f.get_spot_price(1).unwrap(), 20);
+            assert_eq!(f.get_last_price(1), Some(20));
+        }
+
+        #[ink::test]
+        fn test_add_liquidity_insufficient_shares() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 10);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(500);
+            assert_eq!(
+                f.add_liquidity(1, 100, 0),
+                Err(FractionalError::InsufficientShares)
+            );
+        }
+
+        #[ink::test]
+        fn test_add_liquidity_slippage_check() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(100);
+            // isqrt(100 * 100) = 100; require > 100 → SlippageExceeded
+            assert_eq!(
+                f.add_liquidity(1, 100, 101),
+                Err(FractionalError::SlippageExceeded)
+            );
+        }
+
+        #[ink::test]
+        fn test_remove_liquidity() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(1000);
+            let lp = f.add_liquidity(1, 200, 0).unwrap();
+
+            let (shares_out, value_out) = f.remove_liquidity(1, lp, 0, 0).unwrap();
+            assert_eq!(shares_out, 200);
+            assert_eq!(value_out, 1000);
+            // Pool should be empty
+            let pool = f.get_pool(1).unwrap();
+            assert_eq!(pool.share_reserve, 0);
+            assert_eq!(pool.value_reserve, 0);
+            // Shares returned to alice
+            assert_eq!(f.balance_of(alice(), 1), 1000);
+        }
+
+        #[ink::test]
+        fn test_remove_liquidity_insufficient_lp() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(500);
+            let lp = f.add_liquidity(1, 100, 0).unwrap();
+
+            assert_eq!(
+                f.remove_liquidity(1, lp + 1, 0, 0),
+                Err(FractionalError::InsufficientLpShares)
+            );
+        }
+
+        #[ink::test]
+        fn test_swap_shares_for_value() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            // Seed pool: 100 shares, 10_000 value → spot = 100
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000);
+            f.add_liquidity(1, 100, 0).unwrap();
+
+            // Alice swaps 10 shares for value
+            let value_out = f.swap_shares_for_value(1, 10, 0).unwrap();
+            assert!(value_out > 0);
+            // After swap: share_reserve grows, value_reserve shrinks → spot decreases
+            let new_spot = f.get_spot_price(1).unwrap();
+            assert!(new_spot < 100);
+        }
+
+        #[ink::test]
+        fn test_swap_no_pool() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 100);
+            assert_eq!(
+                f.swap_shares_for_value(1, 10, 0),
+                Err(FractionalError::PoolNotFound)
+            );
+        }
+
+        #[ink::test]
+        fn test_swap_slippage_check() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000);
+            f.add_liquidity(1, 100, 0).unwrap();
+
+            // Demand more value_out than the pool can give
+            assert_eq!(
+                f.swap_shares_for_value(1, 10, 10_000),
+                Err(FractionalError::SlippageExceeded)
+            );
+        }
+
+        #[ink::test]
+        fn test_get_spot_price_no_pool() {
             let f = Fractional::new();
-            let m = f.get_metrics(42);
-            assert_eq!(m.trade_count, 0);
-            assert_eq!(m.total_volume, 0);
-            assert_eq!(m.unique_holders, 0);
-            assert_eq!(m.all_time_high_price, 0);
-            assert_eq!(m.all_time_low_price, 0);
+            assert_eq!(f.get_spot_price(99), Err(FractionalError::PoolNotFound));
         }
 
         #[ink::test]
-        fn test_mint_increments_unique_holders() {
-            let mut f = Fractional::new();
-            f.mint_shares(alice(), 1, 100);
-            assert_eq!(f.get_metrics(1).unique_holders, 1);
-            // Minting more to same account doesn't double-count
-            f.mint_shares(alice(), 1, 50);
-            assert_eq!(f.get_metrics(1).unique_holders, 1);
-            // New account increments
-            f.mint_shares(bob(), 1, 200);
-            assert_eq!(f.get_metrics(1).unique_holders, 2);
-        }
-
-        #[ink::test]
-        fn test_redeem_decrements_unique_holders() {
-            let mut f = Fractional::new();
-            test::set_caller::<ink::env::DefaultEnvironment>(alice());
-            f.mint_shares(alice(), 1, 100);
-            f.set_last_price(1, 5);
-            assert_eq!(f.get_metrics(1).unique_holders, 1);
-            // Redeem all shares → holder count drops to 0
-            f.redeem_shares(1, 100).unwrap();
-            assert_eq!(f.get_metrics(1).unique_holders, 0);
-        }
-
-        #[ink::test]
-        fn test_redeem_records_trade_volume_and_count() {
-            let mut f = Fractional::new();
-            test::set_caller::<ink::env::DefaultEnvironment>(alice());
-            f.mint_shares(alice(), 1, 100);
-            f.set_last_price(1, 10);
-            f.redeem_shares(1, 50).unwrap(); // payout = 500
-            let m = f.get_metrics(1);
-            assert_eq!(m.trade_count, 1);
-            assert_eq!(m.total_volume, 500);
-        }
-
-        #[ink::test]
-        fn test_all_time_high_and_low_price() {
-            let mut f = Fractional::new();
-            test::set_caller::<ink::env::DefaultEnvironment>(alice());
-            f.mint_shares(alice(), 1, 1000);
-
-            // First redemption at price 10
-            f.set_last_price(1, 10);
-            f.redeem_shares(1, 10).unwrap();
-            let m = f.get_metrics(1);
-            assert_eq!(m.all_time_high_price, 10);
-            assert_eq!(m.all_time_low_price, 10);
-
-            // Second redemption at higher price 20
-            f.set_last_price(1, 20);
-            f.redeem_shares(1, 10).unwrap();
-            let m = f.get_metrics(1);
-            assert_eq!(m.all_time_high_price, 20);
-            assert_eq!(m.all_time_low_price, 10); // low unchanged
-
-            // Third redemption at lower price 5
-            f.set_last_price(1, 5);
-            f.redeem_shares(1, 10).unwrap();
-            let m = f.get_metrics(1);
-            assert_eq!(m.all_time_high_price, 20); // high unchanged
-            assert_eq!(m.all_time_low_price, 5);
-        }
-
-        #[ink::test]
-        fn test_cumulative_volume_across_trades() {
-            let mut f = Fractional::new();
-            test::set_caller::<ink::env::DefaultEnvironment>(alice());
-            f.mint_shares(alice(), 1, 1000);
-            f.set_last_price(1, 10);
-            f.redeem_shares(1, 10).unwrap(); // 100
-            f.redeem_shares(1, 20).unwrap(); // 200
-            let m = f.get_metrics(1);
-            assert_eq!(m.trade_count, 2);
-            assert_eq!(m.total_volume, 300);
+        fn test_isqrt() {
+            assert_eq!(Fractional::isqrt(0), 0);
+            assert_eq!(Fractional::isqrt(1), 1);
+            assert_eq!(Fractional::isqrt(4), 2);
+            assert_eq!(Fractional::isqrt(9), 3);
+            assert_eq!(Fractional::isqrt(10_000), 100);
         }
     }
 }

@@ -106,7 +106,7 @@ pub mod propchain_identity {
         pub reputation_score: u32, // 0-1000 reputation score
         pub verification_level: VerificationLevel,
         pub kyc_tier: KycTier, // KYC tier level - Issue #282
-        pub trust_score: u32, // Trust score 0-100
+        pub trust_score: u32,  // Trust score 0-100
         pub is_verified: bool,
         pub verified_at: Option<u64>,
         pub verification_expires: Option<u64>,
@@ -213,15 +213,22 @@ pub mod propchain_identity {
 
     /// KYC Tier structure for tiered verification - Issue #282
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum KycTier {
-        Tier0_Unverified,    // No KYC, basic access only
-        Tier1_Basic,         // Basic identity verification
-        Tier2_Standard,      // Standard KYC with document verification
-        Tier3_Enhanced,      // Enhanced due diligence
-        Tier4_Premium,       // Premium verification with full background check
+        Tier0_Unverified, // No KYC, basic access only
+        Tier1_Basic,      // Basic identity verification
+        Tier2_Standard,   // Standard KYC with document verification
+        Tier3_Enhanced,   // Enhanced due diligence
+        Tier4_Premium,    // Premium verification with full background check
     }
 
     /// KYC Tier privileges
@@ -256,15 +263,22 @@ pub mod propchain_identity {
 
     /// Provider type classification
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum ProviderType {
-        GovernmentId,       // Official government ID verification
-        DocumentVerification, // Passport, driver's license, etc.
+        GovernmentId,          // Official government ID verification
+        DocumentVerification,  // Passport, driver's license, etc.
         BiometricVerification, // Facial recognition, fingerprints
         FinancialVerification, // Bank account, credit check
-        ThirdPartyKyc,      // Third-party KYC services
+        ThirdPartyKyc,         // Third-party KYC services
     }
 
     /// Verification request with provider
@@ -587,10 +601,10 @@ pub mod propchain_identity {
                 kyc_tier_privileges: Mapping::default(),
                 user_kyc_tiers: Mapping::default(),
             };
-            
+
             // Initialize default KYC tier privileges
             registry.initialize_kyc_tiers();
-            
+
             registry
         }
 
@@ -1680,7 +1694,7 @@ pub mod propchain_identity {
                 if let Some(mut identity) = self.identities.get(&request.applicant) {
                     identity.kyc_tier = request.requested_tier;
                     identity.last_activity = timestamp;
-                    
+
                     // Map KYC tier to verification level
                     identity.verification_level = match request.requested_tier {
                         KycTier::Tier0_Unverified => VerificationLevel::None,
@@ -1689,10 +1703,10 @@ pub mod propchain_identity {
                         KycTier::Tier3_Enhanced => VerificationLevel::Enhanced,
                         KycTier::Tier4_Premium => VerificationLevel::Premium,
                     };
-                    
+
                     identity.is_verified = true;
                     identity.verified_at = Some(timestamp);
-                    
+
                     self.identities.insert(&request.applicant, &identity);
                 }
 
@@ -1880,7 +1894,7 @@ pub mod propchain_identity {
         #[ink::test]
         fn test_kyc_tier_privileges_initialized() {
             let reg = default_registry();
-            
+
             // Check that KYC tiers are initialized
             let tier0 = reg.get_kyc_tier_privileges(KycTier::Tier0_Unverified);
             assert!(tier0.is_some());
@@ -1922,7 +1936,7 @@ pub mod propchain_identity {
         fn test_kyc_verification_flow() {
             let mut reg = default_registry();
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            
+
             // Create identity as bob
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             reg.create_identity(
@@ -1948,11 +1962,7 @@ pub mod propchain_identity {
             // Bob requests KYC verification
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
-                .request_kyc_verification(
-                    provider_id,
-                    KycTier::Tier2_Standard,
-                    Some([0xAB; 32]),
-                )
+                .request_kyc_verification(provider_id, KycTier::Tier2_Standard, Some([0xAB; 32]))
                 .unwrap();
 
             assert_eq!(request_id, 1);
@@ -1977,7 +1987,7 @@ pub mod propchain_identity {
         fn test_check_tier_privileges() {
             let mut reg = default_registry();
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            
+
             // Create identity and get Tier2
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             reg.create_identity(
@@ -2001,11 +2011,7 @@ pub mod propchain_identity {
 
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
-                .request_kyc_verification(
-                    accounts.charlie,
-                    KycTier::Tier3_Enhanced,
-                    None,
-                )
+                .request_kyc_verification(accounts.charlie, KycTier::Tier3_Enhanced, None)
                 .unwrap();
 
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);

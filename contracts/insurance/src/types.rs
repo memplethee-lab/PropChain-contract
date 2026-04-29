@@ -175,6 +175,7 @@ pub struct ReinsuranceAgreement {
     pub reinsurer: AccountId,
     pub coverage_limit: u128,
     pub retention_limit: u128,
+    /// Basis points of premium to cede (e.g. 2000 = 20%). Used for QuotaShare.
     pub premium_ceded_rate: u32,
     pub coverage_types: Vec<CoverageType>,
     pub start_time: u64,
@@ -182,6 +183,12 @@ pub struct ReinsuranceAgreement {
     pub is_active: bool,
     pub total_ceded_premiums: u128,
     pub total_recoveries: u128,
+    /// How risk is distributed with this reinsurer
+    pub treaty_type: ReinsuranceTreatyType,
+    /// Running count of premium cessions under this agreement
+    pub cession_count: u64,
+    /// Running count of loss recoveries under this agreement
+    pub recovery_count: u64,
 }
 
 #[derive(
@@ -239,4 +246,72 @@ pub struct PoolLiquidityProvider {
     pub deposited_at: u64,
     pub last_reward_claim: u64,
     pub accumulated_rewards: u128,
+}
+
+// =========================================================================
+// REINSURANCE DISTRIBUTION TYPES
+// =========================================================================
+
+/// Treaty type determines how risk is shared with the reinsurer
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum ReinsuranceTreatyType {
+    /// Quota Share: cede a fixed % of every premium and claim
+    QuotaShare,
+    /// Excess of Loss: reinsurer covers losses above a retention threshold
+    ExcessOfLoss,
+    /// Surplus: cede the portion of risk exceeding the insurer's line
+    Surplus,
+}
+
+/// Tracks a single premium cession event for audit purposes
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PremiumCession {
+    pub cession_id: u64,
+    pub agreement_id: u64,
+    pub policy_id: u64,
+    pub gross_premium: u128,
+    pub ceded_premium: u128,
+    pub ceded_at: u64,
+}
+
+/// Tracks a single loss recovery request from a reinsurer
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct LossRecovery {
+    pub recovery_id: u64,
+    pub agreement_id: u64,
+    pub claim_id: u64,
+    pub gross_loss: u128,
+    pub recovered_amount: u128,
+    pub recovered_at: u64,
+}
+
+/// Summary statistics for a reinsurance agreement
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ReinsuranceStats {
+    pub agreement_id: u64,
+    pub treaty_type: ReinsuranceTreatyType,
+    pub total_ceded_premiums: u128,
+    pub total_recoveries: u128,
+    pub cession_count: u64,
+    pub recovery_count: u64,
+    /// Net position: recoveries - ceded_premiums (can be negative conceptually, stored as i128)
+    pub net_recovery: i128,
 }

@@ -54,6 +54,16 @@ mod propchain_insurance {
         reinsurance_agreements: Mapping<u64, ReinsuranceAgreement>,
         reinsurance_count: u64,
 
+        // Reinsurance distribution ledger
+        premium_cessions: Mapping<u64, PremiumCession>,
+        cession_count: u64,
+        loss_recoveries: Mapping<u64, LossRecovery>,
+        loss_recovery_count: u64,
+        // agreement_id -> list of cession IDs
+        agreement_cessions: Mapping<u64, Vec<u64>>,
+        // agreement_id -> list of recovery IDs
+        agreement_recoveries: Mapping<u64, Vec<u64>>,
+
         // Insurance Tokens (secondary market)
         insurance_tokens: Mapping<u64, InsuranceToken>,
         token_count: u64,
@@ -180,6 +190,36 @@ mod propchain_insurance {
     }
 
     #[ink(event)]
+    pub struct PremiumCeded {
+        #[ink(topic)]
+        agreement_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+        cession_id: u64,
+        ceded_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct LossRecovered {
+        #[ink(topic)]
+        agreement_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        recovery_id: u64,
+        recovered_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct ReinsuranceAgreementDeactivated {
+        #[ink(topic)]
+        agreement_id: u64,
+        deactivated_by: AccountId,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
     pub struct InsuranceTokenMinted {
         #[ink(topic)]
         token_id: u64,
@@ -231,6 +271,12 @@ mod propchain_insurance {
                 risk_assessments: Mapping::default(),
                 reinsurance_agreements: Mapping::default(),
                 reinsurance_count: 0,
+                premium_cessions: Mapping::default(),
+                cession_count: 0,
+                loss_recoveries: Mapping::default(),
+                loss_recovery_count: 0,
+                agreement_cessions: Mapping::default(),
+                agreement_recoveries: Mapping::default(),
                 insurance_tokens: Mapping::default(),
                 token_count: 0,
                 token_listings: Vec::new(),
@@ -780,11 +826,262 @@ mod propchain_insurance {
                 is_active: true,
                 total_ceded_premiums: 0,
                 total_recoveries: 0,
+                treaty_type: ReinsuranceTreatyType::ExcessOfLoss,
+                cession_count: 0,
+                recovery_count: 0,
             };
 
             self.reinsurance_agreements
                 .insert(&agreement_id, &agreement);
             Ok(agreement_id)
+        }
+
+        /// Register a reinsurance agreement with an explicit treaty type (admin only)
+        #[ink(message)]
+        pub fn register_reinsurance_with_type(
+            &mut self,
+            reinsurer: AccountId,
+            treaty_type: ReinsuranceTreatyType,
+            coverage_limit: u128,
+            retention_limit: u128,
+            premium_ceded_rate: u32,
+            coverage_types: Vec<CoverageType>,
+            duration_seconds: u64,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let now = self.env().block_timestamp();
+            let agreement_id = self.reinsurance_count + 1;
+            self.reinsurance_count = agreement_id;
+
+            let agreement = ReinsuranceAgreement {
+                agreement_id,
+                reinsurer,
+                coverage_limit,
+                retention_limit,
+                premium_ceded_rate,
+                coverage_types,
+                start_time: now,
+                end_time: now.saturating_add(duration_seconds),
+                is_active: true,
+                total_ceded_premiums: 0,
+                total_recoveries: 0,
+                treaty_type,
+                cession_count: 0,
+                recovery_count: 0,
+            };
+
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+            Ok(agreement_id)
+        }
+
+        /// Deactivate a reinsurance agreement (admin only)
+        #[ink(message)]
+        pub fn deactivate_reinsurance(&mut self, agreement_id: u64) -> Result<(), InsuranceError> {
+            self.ensure_admin()?;
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            agreement.is_active = false;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            self.env().emit_event(ReinsuranceAgreementDeactivated {
+                agreement_id,
+                deactivated_by: self.env().caller(),
+                timestamp: self.env().block_timestamp(),
+            });
+            Ok(())
+        }
+
+        /// Manually cede a premium amount to a specific reinsurance agreement (admin only).
+        /// Useful for proportional (quota share / surplus) treaties where cession is
+        /// tracked separately from automatic excess-of-loss recovery.
+        #[ink(message)]
+        pub fn cede_premium(
+            &mut self,
+            agreement_id: u64,
+            policy_id: u64,
+            gross_premium: u128,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            if !agreement.is_active {
+                return Err(InsuranceError::ReinsuranceAgreementInactive);
+            }
+            let now = self.env().block_timestamp();
+            if now > agreement.end_time {
+                return Err(InsuranceError::ReinsuranceAgreementExpired);
+            }
+
+            // Ceded amount depends on treaty type
+            let ceded_amount = match agreement.treaty_type {
+                ReinsuranceTreatyType::QuotaShare => {
+                    // Fixed % of every premium
+                    gross_premium.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+                ReinsuranceTreatyType::Surplus => {
+                    // Cede the portion above the retention limit
+                    if gross_premium > agreement.retention_limit {
+                        gross_premium
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+                ReinsuranceTreatyType::ExcessOfLoss => {
+                    // Premium cession for XL is typically a flat rate
+                    gross_premium.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+            };
+
+            if ceded_amount == 0 {
+                return Err(InsuranceError::InvalidParameters);
+            }
+
+            let cession_id = self.cession_count + 1;
+            self.cession_count = cession_id;
+
+            let cession = PremiumCession {
+                cession_id,
+                agreement_id,
+                policy_id,
+                gross_premium,
+                ceded_premium: ceded_amount,
+                ceded_at: now,
+            };
+            self.premium_cessions.insert(&cession_id, &cession);
+
+            // Update agreement totals
+            agreement.total_ceded_premiums =
+                agreement.total_ceded_premiums.saturating_add(ceded_amount);
+            agreement.cession_count += 1;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            // Index cession under agreement
+            let mut cessions = self
+                .agreement_cessions
+                .get(&agreement_id)
+                .unwrap_or_default();
+            cessions.push(cession_id);
+            self.agreement_cessions.insert(&agreement_id, &cessions);
+
+            self.env().emit_event(PremiumCeded {
+                agreement_id,
+                policy_id,
+                cession_id,
+                ceded_amount,
+                timestamp: now,
+            });
+
+            Ok(cession_id)
+        }
+
+        /// Record a loss recovery from a reinsurer for an approved claim (admin only).
+        /// Call this after the reinsurer has settled their share of a large claim.
+        #[ink(message)]
+        pub fn record_loss_recovery(
+            &mut self,
+            agreement_id: u64,
+            claim_id: u64,
+            gross_loss: u128,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            if !agreement.is_active {
+                return Err(InsuranceError::ReinsuranceAgreementInactive);
+            }
+
+            // Verify the claim exists
+            self.claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            let now = self.env().block_timestamp();
+
+            let recovered_amount = match agreement.treaty_type {
+                ReinsuranceTreatyType::ExcessOfLoss => {
+                    // Recover the portion above retention, capped at coverage limit
+                    if gross_loss > agreement.retention_limit {
+                        gross_loss
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+                ReinsuranceTreatyType::QuotaShare => {
+                    // Reinsurer pays their quota share of the loss
+                    gross_loss.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+                ReinsuranceTreatyType::Surplus => {
+                    // Recover the surplus portion
+                    if gross_loss > agreement.retention_limit {
+                        gross_loss
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            if recovered_amount == 0 {
+                return Err(InsuranceError::InvalidParameters);
+            }
+
+            let recovery_id = self.loss_recovery_count + 1;
+            self.loss_recovery_count = recovery_id;
+
+            let recovery = LossRecovery {
+                recovery_id,
+                agreement_id,
+                claim_id,
+                gross_loss,
+                recovered_amount,
+                recovered_at: now,
+            };
+            self.loss_recoveries.insert(&recovery_id, &recovery);
+
+            // Update agreement totals
+            agreement.total_recoveries =
+                agreement.total_recoveries.saturating_add(recovered_amount);
+            agreement.recovery_count += 1;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            // Index recovery under agreement
+            let mut recoveries = self
+                .agreement_recoveries
+                .get(&agreement_id)
+                .unwrap_or_default();
+            recoveries.push(recovery_id);
+            self.agreement_recoveries.insert(&agreement_id, &recoveries);
+
+            self.env().emit_event(LossRecovered {
+                agreement_id,
+                claim_id,
+                recovery_id,
+                recovered_amount,
+                timestamp: now,
+            });
+
+            Ok(recovery_id)
         }
 
         // =====================================================================
@@ -1065,6 +1362,57 @@ mod propchain_insurance {
             self.reinsurance_agreements.get(&agreement_id)
         }
 
+        /// Get a premium cession record
+        #[ink(message)]
+        pub fn get_premium_cession(&self, cession_id: u64) -> Option<PremiumCession> {
+            self.premium_cessions.get(&cession_id)
+        }
+
+        /// Get a loss recovery record
+        #[ink(message)]
+        pub fn get_loss_recovery(&self, recovery_id: u64) -> Option<LossRecovery> {
+            self.loss_recoveries.get(&recovery_id)
+        }
+
+        /// Get all cession IDs for a reinsurance agreement
+        #[ink(message)]
+        pub fn get_agreement_cessions(&self, agreement_id: u64) -> Vec<u64> {
+            self.agreement_cessions
+                .get(&agreement_id)
+                .unwrap_or_default()
+        }
+
+        /// Get all recovery IDs for a reinsurance agreement
+        #[ink(message)]
+        pub fn get_agreement_recoveries(&self, agreement_id: u64) -> Vec<u64> {
+            self.agreement_recoveries
+                .get(&agreement_id)
+                .unwrap_or_default()
+        }
+
+        /// Get aggregated reinsurance statistics for an agreement
+        #[ink(message)]
+        pub fn get_reinsurance_stats(&self, agreement_id: u64) -> Option<ReinsuranceStats> {
+            let agreement = self.reinsurance_agreements.get(&agreement_id)?;
+            let net_recovery = (agreement.total_recoveries as i128)
+                .saturating_sub(agreement.total_ceded_premiums as i128);
+            Some(ReinsuranceStats {
+                agreement_id,
+                treaty_type: agreement.treaty_type,
+                total_ceded_premiums: agreement.total_ceded_premiums,
+                total_recoveries: agreement.total_recoveries,
+                cession_count: agreement.cession_count,
+                recovery_count: agreement.recovery_count,
+                net_recovery,
+            })
+        }
+
+        /// Get total number of reinsurance agreements
+        #[ink(message)]
+        pub fn get_reinsurance_count(&self) -> u64 {
+            self.reinsurance_count
+        }
+
         /// Get underwriting criteria for a pool
         #[ink(message)]
         pub fn get_underwriting_criteria(&self, pool_id: u64) -> Option<UnderwritingCriteria> {
@@ -1255,17 +1603,65 @@ mod propchain_insurance {
                         continue;
                     }
 
-                    let recovery = amount.saturating_sub(agreement.retention_limit);
-                    let capped_recovery = recovery.min(agreement.coverage_limit);
+                    let recovery = match agreement.treaty_type {
+                        ReinsuranceTreatyType::ExcessOfLoss => {
+                            if amount > agreement.retention_limit {
+                                amount
+                                    .saturating_sub(agreement.retention_limit)
+                                    .min(agreement.coverage_limit)
+                            } else {
+                                0
+                            }
+                        }
+                        ReinsuranceTreatyType::QuotaShare => {
+                            amount.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                        }
+                        ReinsuranceTreatyType::Surplus => {
+                            if amount > agreement.retention_limit {
+                                amount
+                                    .saturating_sub(agreement.retention_limit)
+                                    .min(agreement.coverage_limit)
+                            } else {
+                                0
+                            }
+                        }
+                    };
 
-                    if capped_recovery > 0 {
-                        agreement.total_recoveries += capped_recovery;
+                    if recovery > 0 {
+                        // Record the loss recovery
+                        let recovery_id = self.loss_recovery_count + 1;
+                        self.loss_recovery_count = recovery_id;
+
+                        let loss_recovery = LossRecovery {
+                            recovery_id,
+                            agreement_id: i,
+                            claim_id,
+                            gross_loss: amount,
+                            recovered_amount: recovery,
+                            recovered_at: now,
+                        };
+                        self.loss_recoveries.insert(&recovery_id, &loss_recovery);
+
+                        let mut recoveries = self.agreement_recoveries.get(&i).unwrap_or_default();
+                        recoveries.push(recovery_id);
+                        self.agreement_recoveries.insert(&i, &recoveries);
+
+                        agreement.total_recoveries += recovery;
+                        agreement.recovery_count += 1;
                         self.reinsurance_agreements.insert(&i, &agreement);
 
                         self.env().emit_event(ReinsuranceActivated {
                             claim_id,
                             agreement_id: i,
-                            recovery_amount: capped_recovery,
+                            recovery_amount: recovery,
+                            timestamp: now,
+                        });
+
+                        self.env().emit_event(LossRecovered {
+                            agreement_id: i,
+                            claim_id,
+                            recovery_id,
+                            recovered_amount: recovery,
                             timestamp: now,
                         });
 

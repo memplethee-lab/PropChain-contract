@@ -569,13 +569,10 @@ mod bridge {
             let gas_fee = if self.config.gas_limit_per_bridge == 0 {
                 0
             } else {
-                let gas_ratio_bps =
-                    (u128::from(gas_estimate).saturating_mul(10_000))
-                        / u128::from(self.config.gas_limit_per_bridge);
+                let gas_ratio_bps = (u128::from(gas_estimate).saturating_mul(10_000))
+                    / u128::from(self.config.gas_limit_per_bridge);
                 let chain_risk_bps = u128::from(chain_info.confirmation_blocks).saturating_mul(10);
-                let adjusted_bps = gas_ratio_bps
-                    .saturating_add(chain_risk_bps)
-                    .min(2_500);
+                let adjusted_bps = gas_ratio_bps.saturating_add(chain_risk_bps).min(2_500);
                 amount_in.saturating_mul(adjusted_bps) / 10_000
             };
             Ok(BridgeFeeQuote {

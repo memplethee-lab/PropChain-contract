@@ -23,4 +23,7 @@ pub enum InsuranceError {
     PropertyNotInsurable,
     DuplicateClaim,
     ReentrantCall,
+    ReinsuranceAgreementNotFound,
+    ReinsuranceAgreementExpired,
+    ReinsuranceAgreementInactive,
 }

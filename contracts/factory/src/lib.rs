@@ -3,8 +3,8 @@
 use ink::prelude::string::String;
 use ink::prelude::vec::Vec;
 
-pub mod templates;
 pub mod builder;
+pub mod templates;
 
 #[cfg(test)]
 mod tests;
@@ -40,7 +40,10 @@ pub mod contract_factory {
 
     /// Deployed contract information
     #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
-    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
     pub struct DeployedContract {
         pub contract_type: ContractType,
         pub address: AccountId,
@@ -160,11 +163,9 @@ pub mod contract_factory {
                 .code_hash(code_hash)
                 .gas_limit(0)
                 .endowment(self.env().transferred_value())
-                .exec_input(
-                    ink::env::call::ExecutionInput::new(ink::env::call::Selector::new(
-                        ink::selector_bytes!("new"),
-                    ))
-                )
+                .exec_input(ink::env::call::ExecutionInput::new(
+                    ink::env::call::Selector::new(ink::selector_bytes!("new")),
+                ))
                 .salt_bytes(&config.salt)
                 .returns::<AccountId>()
                 .params();
@@ -194,10 +195,7 @@ pub mod contract_factory {
             self.deployment_count += 1;
 
             // Update deployer's contract list
-            let mut deployer_list = self
-                .deployer_contracts
-                .get(&deployer)
-                .unwrap_or_default();
+            let mut deployer_list = self.deployer_contracts.get(&deployer).unwrap_or_default();
             deployer_list.push(deployment_id);
             self.deployer_contracts.insert(&deployer, &deployer_list);
 
