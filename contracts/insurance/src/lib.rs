@@ -86,6 +86,17 @@ mod propchain_insurance {
 
         // Reentrancy protection
         reentrancy_guard: ReentrancyGuard,
+
+        // ── Parametric insurance (Issue #249) ────────────────────────────────
+        parametric_policies: Mapping<u64, ParametricPolicy>,
+        parametric_policy_count: u64,
+        /// property_id → list of parametric policy IDs
+        property_parametric_policies: Mapping<u64, Vec<u64>>,
+        /// holder → list of parametric policy IDs
+        holder_parametric_policies: Mapping<AccountId, Vec<u64>>,
+        /// oracle data points submitted
+        oracle_data: Mapping<u64, OracleDataPoint>,
+        oracle_data_count: u64,
     }
 
     // =========================================================================
@@ -210,6 +221,43 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
+    // ── Parametric insurance events (Issue #249) ──────────────────────────────
+
+    #[ink(event)]
+    pub struct ParametricPolicyCreated {
+        #[ink(topic)]
+        policy_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        #[ink(topic)]
+        property_id: u64,
+        metric: String,
+        trigger_threshold: i128,
+        coverage_amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct ParametricPolicyTriggered {
+        #[ink(topic)]
+        policy_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        oracle_value: i128,
+        payout_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct OracleDataSubmitted {
+        #[ink(topic)]
+        data_id: u64,
+        #[ink(topic)]
+        property_id: u64,
+        metric: String,
+        value: i128,
+        timestamp: u64,
+    }
+
     // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
@@ -246,6 +294,13 @@ mod propchain_insurance {
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
                 reentrancy_guard: ReentrancyGuard::new(),
+                // Parametric insurance (Issue #249)
+                parametric_policies: Mapping::default(),
+                parametric_policy_count: 0,
+                property_parametric_policies: Mapping::default(),
+                holder_parametric_policies: Mapping::default(),
+                oracle_data: Mapping::default(),
+                oracle_data_count: 0,
             }
         }
 
@@ -957,6 +1012,290 @@ mod propchain_insurance {
         }
 
         // =====================================================================
+        // PARAMETRIC INSURANCE (Issue #249)
+        // =====================================================================
+
+        /// Create a parametric insurance policy.
+        ///
+        /// The caller pays the premium upfront. When an authorized oracle later
+        /// submits a data point for `property_id` / `metric` that satisfies the
+        /// trigger condition, the full `coverage_amount` is paid out automatically
+        /// from the backing risk pool — no manual claims assessment required.
+        #[ink(message, payable)]
+        pub fn create_parametric_policy(
+            &mut self,
+            property_id: u64,
+            metric: String,
+            trigger_threshold: i128,
+            comparison: TriggerComparison,
+            coverage_amount: u128,
+            pool_id: u64,
+            duration_seconds: u64,
+        ) -> Result<u64, InsuranceError> {
+            let caller = self.env().caller();
+            let paid = self.env().transferred_value();
+            let now = self.env().block_timestamp();
+
+            if paid == 0 {
+                return Err(InsuranceError::InsufficientPremium);
+            }
+
+            // Validate pool has enough capital
+            let mut pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+            if !pool.is_active {
+                return Err(InsuranceError::PoolNotFound);
+            }
+            let max_exposure = pool
+                .available_capital
+                .saturating_mul(pool.max_coverage_ratio as u128)
+                / 10_000;
+            if coverage_amount > max_exposure {
+                return Err(InsuranceError::InsufficientPoolFunds);
+            }
+
+            // Credit premium to pool
+            let fee = paid.saturating_mul(self.platform_fee_rate as u128) / 10_000;
+            let pool_share = paid.saturating_sub(fee);
+            pool.total_premiums_collected += pool_share;
+            pool.available_capital += pool_share;
+            pool.active_policies += 1;
+            self.pools.insert(&pool_id, &pool);
+
+            let policy_id = self.parametric_policy_count + 1;
+            self.parametric_policy_count = policy_id;
+
+            let policy = ParametricPolicy {
+                policy_id,
+                property_id,
+                policyholder: caller,
+                metric: metric.clone(),
+                trigger_threshold,
+                comparison,
+                coverage_amount,
+                premium_amount: paid,
+                pool_id,
+                start_time: now,
+                end_time: now.saturating_add(duration_seconds),
+                status: ParametricPolicyStatus::Active,
+            };
+
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            let mut prop_list = self
+                .property_parametric_policies
+                .get(&property_id)
+                .unwrap_or_default();
+            prop_list.push(policy_id);
+            self.property_parametric_policies
+                .insert(&property_id, &prop_list);
+
+            let mut holder_list = self
+                .holder_parametric_policies
+                .get(&caller)
+                .unwrap_or_default();
+            holder_list.push(policy_id);
+            self.holder_parametric_policies.insert(&caller, &holder_list);
+
+            self.env().emit_event(ParametricPolicyCreated {
+                policy_id,
+                policyholder: caller,
+                property_id,
+                metric,
+                trigger_threshold,
+                coverage_amount,
+            });
+
+            Ok(policy_id)
+        }
+
+        /// Submit an oracle data point for a property metric.
+        ///
+        /// Only authorized oracles (or the admin) may call this. After recording
+        /// the data point, all active parametric policies for the property whose
+        /// trigger condition is satisfied are paid out automatically.
+        #[ink(message)]
+        pub fn submit_oracle_data(
+            &mut self,
+            property_id: u64,
+            metric: String,
+            value: i128,
+        ) -> Result<u64, InsuranceError> {
+            let caller = self.env().caller();
+            if caller != self.admin && !self.authorized_oracles.get(&caller).unwrap_or(false) {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            let now = self.env().block_timestamp();
+            let data_id = self.oracle_data_count + 1;
+            self.oracle_data_count = data_id;
+
+            let data_point = OracleDataPoint {
+                data_id,
+                property_id,
+                metric: metric.clone(),
+                value,
+                submitted_by: caller,
+                submitted_at: now,
+            };
+            self.oracle_data.insert(&data_id, &data_point);
+
+            self.env().emit_event(OracleDataSubmitted {
+                data_id,
+                property_id,
+                metric: metric.clone(),
+                value,
+                timestamp: now,
+            });
+
+            // Evaluate all active parametric policies for this property + metric
+            let policy_ids = self
+                .property_parametric_policies
+                .get(&property_id)
+                .unwrap_or_default();
+
+            for pid in policy_ids {
+                if let Some(policy) = self.parametric_policies.get(&pid) {
+                    if policy.status != ParametricPolicyStatus::Active {
+                        continue;
+                    }
+                    if now > policy.end_time {
+                        continue;
+                    }
+                    if policy.metric != metric {
+                        continue;
+                    }
+                    let triggered = match policy.comparison {
+                        TriggerComparison::GreaterThanOrEqual => value >= policy.trigger_threshold,
+                        TriggerComparison::LessThanOrEqual => value <= policy.trigger_threshold,
+                    };
+                    if triggered {
+                        // Ignore individual payout errors so other policies still process
+                        let _ = self.execute_parametric_payout(pid, value, now);
+                    }
+                }
+            }
+
+            Ok(data_id)
+        }
+
+        /// Cancel an active parametric policy (policyholder or admin).
+        #[ink(message)]
+        pub fn cancel_parametric_policy(&mut self, policy_id: u64) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let mut policy = self
+                .parametric_policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::ParametricPolicyNotFound)?;
+
+            if caller != policy.policyholder && caller != self.admin {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if policy.status != ParametricPolicyStatus::Active {
+                return Err(InsuranceError::ParametricPolicyInactive);
+            }
+
+            policy.status = ParametricPolicyStatus::Cancelled;
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            if let Some(mut pool) = self.pools.get(&policy.pool_id) {
+                if pool.active_policies > 0 {
+                    pool.active_policies -= 1;
+                }
+                self.pools.insert(&policy.pool_id, &pool);
+            }
+
+            Ok(())
+        }
+
+        // ── Parametric queries ────────────────────────────────────────────────
+
+        /// Get a parametric policy by ID.
+        #[ink(message)]
+        pub fn get_parametric_policy(&self, policy_id: u64) -> Option<ParametricPolicy> {
+            self.parametric_policies.get(&policy_id)
+        }
+
+        /// Get all parametric policy IDs for a property.
+        #[ink(message)]
+        pub fn get_property_parametric_policies(&self, property_id: u64) -> Vec<u64> {
+            self.property_parametric_policies
+                .get(&property_id)
+                .unwrap_or_default()
+        }
+
+        /// Get all parametric policy IDs for a policyholder.
+        #[ink(message)]
+        pub fn get_holder_parametric_policies(&self, holder: AccountId) -> Vec<u64> {
+            self.holder_parametric_policies
+                .get(&holder)
+                .unwrap_or_default()
+        }
+
+        /// Get an oracle data point by ID.
+        #[ink(message)]
+        pub fn get_oracle_data(&self, data_id: u64) -> Option<OracleDataPoint> {
+            self.oracle_data.get(&data_id)
+        }
+
+        /// Get total parametric policy count.
+        #[ink(message)]
+        pub fn get_parametric_policy_count(&self) -> u64 {
+            self.parametric_policy_count
+        }
+
+        // ── Internal parametric helper ────────────────────────────────────────
+
+        fn execute_parametric_payout(
+            &mut self,
+            policy_id: u64,
+            oracle_value: i128,
+            now: u64,
+        ) -> Result<(), InsuranceError> {
+            let mut policy = self
+                .parametric_policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::ParametricPolicyNotFound)?;
+
+            if policy.status != ParametricPolicyStatus::Active {
+                return Err(InsuranceError::ParametricPolicyAlreadyTriggered);
+            }
+
+            let mut pool = self
+                .pools
+                .get(&policy.pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+
+            if pool.available_capital < policy.coverage_amount {
+                return Err(InsuranceError::InsufficientPoolFunds);
+            }
+
+            pool.available_capital = pool
+                .available_capital
+                .saturating_sub(policy.coverage_amount);
+            pool.total_claims_paid += policy.coverage_amount;
+            if pool.active_policies > 0 {
+                pool.active_policies -= 1;
+            }
+            self.pools.insert(&policy.pool_id, &pool);
+
+            policy.status = ParametricPolicyStatus::Triggered;
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            self.env().emit_event(ParametricPolicyTriggered {
+                policy_id,
+                policyholder: policy.policyholder,
+                oracle_value,
+                payout_amount: policy.coverage_amount,
+                timestamp: now,
+            });
+
+            Ok(())
+        }
+
+        // =====================================================================
         // ADMIN / AUTHORITY MANAGEMENT
         // =====================================================================
 
@@ -1287,3 +1626,5 @@ mod propchain_insurance {
 pub use crate::propchain_insurance::{InsuranceError, PropertyInsurance};
 
 // Unit tests extracted to tests.rs (Issue #101)
+#[path = "tests.rs"]
+mod insurance_tests_module;

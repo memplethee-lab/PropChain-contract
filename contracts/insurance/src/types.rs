@@ -1,4 +1,80 @@
 // Data types for the insurance contract (Issue #101 - extracted from lib.rs)
+// Parametric insurance types added for Issue #249
+
+/// The comparison operator used to evaluate oracle data against a trigger threshold.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerComparison {
+    /// Payout when oracle value >= threshold (e.g. flood depth >= 2m)
+    GreaterThanOrEqual,
+    /// Payout when oracle value <= threshold (e.g. temperature <= -10°C)
+    LessThanOrEqual,
+}
+
+/// Status of a parametric policy.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum ParametricPolicyStatus {
+    Active,
+    Triggered,
+    Expired,
+    Cancelled,
+}
+
+/// A parametric insurance policy that pays out automatically when an oracle
+/// reports a value that crosses the defined trigger threshold.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ParametricPolicy {
+    pub policy_id: u64,
+    pub property_id: u64,
+    pub policyholder: AccountId,
+    /// Human-readable label for the metric being tracked (e.g. "flood_depth_cm")
+    pub metric: String,
+    /// The threshold value (scaled integer, e.g. centimetres or tenths of a degree)
+    pub trigger_threshold: i128,
+    pub comparison: TriggerComparison,
+    /// Full coverage amount paid out automatically when triggered
+    pub coverage_amount: u128,
+    /// Premium paid upfront
+    pub premium_amount: u128,
+    pub pool_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub status: ParametricPolicyStatus,
+}
+
+/// An oracle data submission that may trigger parametric payouts.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct OracleDataPoint {
+    pub data_id: u64,
+    pub property_id: u64,
+    pub metric: String,
+    pub value: i128,
+    pub submitted_by: AccountId,
+    pub submitted_at: u64,
+}
 
 #[derive(
     Debug,
