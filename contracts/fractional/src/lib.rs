@@ -46,6 +46,22 @@ mod fractional {
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct FractionalDashboard {
+        pub owner: AccountId,
+        pub total_value: u128,
+        pub positions: Vec<PortfolioItem>,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct TaxReport {
         pub total_dividends: u128,
         pub total_proceeds: u128,
