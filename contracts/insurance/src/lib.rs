@@ -28,6 +28,9 @@ mod propchain_insurance {
     // Data types extracted to types.rs (Issue #101)
     include!("types.rs");
 
+    // Premium calculation engine
+    mod premium_engine;
+
     #[ink(storage)]
     pub struct PropertyInsurance {
         admin: AccountId,
@@ -391,7 +394,7 @@ mod propchain_insurance {
             Ok(())
         }
 
-        /// Calculate premium for a policy
+        /// Calculate premium for a policy (basic version)
         #[ink(message)]
         pub fn calculate_premium(
             &self,
@@ -399,43 +402,54 @@ mod propchain_insurance {
             coverage_amount: u128,
             coverage_type: CoverageType,
         ) -> Result<PremiumCalculation, InsuranceError> {
+            // Default 1 year duration
+            self.calculate_premium_with_modifiers(
+                property_id,
+                coverage_amount,
+                coverage_type,
+                31_536_000, // 1 year in seconds
+                PremiumModifiers {
+                    has_multiple_policies: false,
+                    claim_free_years: 0,
+                    has_safety_features: false,
+                    loyalty_years: 0,
+                },
+            )
+        }
+
+        /// Calculate premium with dynamic modifiers and pool utilization
+        #[ink(message)]
+        pub fn calculate_premium_with_modifiers(
+            &self,
+            property_id: u64,
+            coverage_amount: u128,
+            coverage_type: CoverageType,
+            duration_seconds: u64,
+            modifiers: PremiumModifiers,
+        ) -> Result<PremiumCalculation, InsuranceError> {
             let assessment = self
                 .risk_assessments
                 .get(&property_id)
                 .ok_or(InsuranceError::PropertyNotInsurable)?;
 
-            // Base rate in basis points: 150 = 1.50%
-            let base_rate: u32 = 150;
+            // Find a suitable pool for this coverage type
+            let pool = self.find_pool_for_coverage(&coverage_type)?;
 
-            // Risk multiplier based on score (100 = 1.0x, 200 = 2.0x)
-            let risk_multiplier = self.risk_score_to_multiplier(assessment.overall_risk_score);
+            // Try to get actuarial model for this coverage type
+            let actuarial_model = self.get_actuarial_model_for_coverage(&coverage_type);
 
-            // Coverage type multiplier
-            let coverage_multiplier = Self::coverage_type_multiplier(&coverage_type);
+            // Use the premium engine for dynamic calculation
+            let calculation = premium_engine::calculate_dynamic_premium(
+                &assessment,
+                coverage_amount,
+                &coverage_type,
+                &pool,
+                actuarial_model,
+                &modifiers,
+                duration_seconds,
+            );
 
-            // Annual premium = coverage * base_rate * risk_mult * coverage_mult / 1_000_000
-            let annual_premium = coverage_amount
-                .saturating_mul(base_rate as u128)
-                .saturating_mul(risk_multiplier as u128)
-                .saturating_mul(coverage_multiplier as u128)
-                / 1_000_000_000_000u128; // 3 basis point divisors × 10000 each
-
-            let monthly_premium = annual_premium / 12;
-
-            // Deductible: 5% of coverage_amount, scaled by risk
-            let deductible = coverage_amount
-                .saturating_mul(500u128)
-                .saturating_mul(risk_multiplier as u128)
-                / 10_000_000u128;
-
-            Ok(PremiumCalculation {
-                base_rate,
-                risk_multiplier,
-                coverage_multiplier,
-                annual_premium,
-                monthly_premium,
-                deductible,
-            })
+            Ok(calculation)
         }
 
         // =====================================================================
@@ -1142,6 +1156,48 @@ mod propchain_insurance {
                 CoverageType::NaturalDisaster => 180,
                 CoverageType::Comprehensive => 250,
             }
+        }
+
+        /// Find a suitable pool for the given coverage type
+        fn find_pool_for_coverage(&self, coverage_type: &CoverageType) -> Result<RiskPool, InsuranceError> {
+            // Iterate through pools to find an active one matching the coverage type
+            // For now, return the first active pool or a default
+            let pool_count = self.pool_count;
+            
+            for pool_id in 1..=pool_count {
+                if let Some(pool) = self.pools.get(&pool_id) {
+                    if pool.is_active && pool.coverage_type == *coverage_type {
+                        return Ok(pool);
+                    }
+                }
+            }
+
+            // If no specific pool found, return the first active pool
+            for pool_id in 1..=pool_count {
+                if let Some(pool) = self.pools.get(&pool_id) {
+                    if pool.is_active {
+                        return Ok(pool);
+                    }
+                }
+            }
+
+            Err(InsuranceError::PoolNotFound)
+        }
+
+        /// Get actuarial model for coverage type
+        fn get_actuarial_model_for_coverage(&self, coverage_type: &CoverageType) -> Option<ActuarialModel> {
+            // Search through models to find one matching the coverage type
+            let model_count = self.model_count;
+            
+            for model_id in 1..=model_count {
+                if let Some(model) = self.actuarial_models.get(&model_id) {
+                    if model.coverage_type == *coverage_type {
+                        return Some(model);
+                    }
+                }
+            }
+            
+            None
         }
 
         fn internal_mint_token(

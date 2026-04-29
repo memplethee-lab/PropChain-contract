@@ -161,9 +161,37 @@ pub struct PremiumCalculation {
     pub base_rate: u32,
     pub risk_multiplier: u32,
     pub coverage_multiplier: u32,
+    pub pool_utilization_multiplier: u32,
+    pub time_multiplier: u32,
+    pub discount_multiplier: u32,
     pub annual_premium: u128,
     pub monthly_premium: u128,
     pub deductible: u128,
+    pub breakdown: PremiumBreakdown,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PremiumBreakdown {
+    pub base_premium: u128,
+    pub risk_adjustment: u128,
+    pub coverage_adjustment: u128,
+    pub pool_adjustment: u128,
+    pub time_adjustment: u128,
+    pub discount_amount: u128,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PremiumModifiers {
+    pub has_multiple_policies: bool,
+    pub claim_free_years: u32,
+    pub has_safety_features: bool,
+    pub loyalty_years: u32,
 }
 
 #[derive(
