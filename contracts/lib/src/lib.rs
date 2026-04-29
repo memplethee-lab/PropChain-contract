@@ -108,6 +108,8 @@ pub mod propchain_contracts {
         SelfTransferNotAllowed,
         /// Range is invalid (min > max)
         InvalidRange,
+        /// External dependency circuit breaker is open
+        ExternalDependencyUnavailable,
         /// Reentrancy guard detected a reentrant call
         ReentrantCall,
     }
@@ -115,6 +117,49 @@ pub mod propchain_contracts {
     impl From<crate::ReentrancyError> for Error {
         fn from(_: crate::ReentrancyError) -> Self {
             Error::ReentrantCall
+        }
+    }
+
+    /// Dependency type for circuit breaker
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        ComplianceRegistry,
+        IdentityRegistry,
+        FeeManager,
+        Oracle,
+    }
+
+    /// Circuit breaker state for external dependencies
+    #[derive(
+        Debug, Clone, PartialEq, Eq, Default, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        pub failure_count: u8,
+        pub total_failures: u32,
+        pub last_failure_at: Option<u64>,
+        pub open_until: Option<u64>,
+    }
+
+    /// Configuration for circuit breakers
+    #[derive(
+        Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        pub failure_threshold: u8,
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300, // 5 minutes default
+            }
         }
     }
 
@@ -187,6 +232,11 @@ pub mod propchain_contracts {
         /// `identity_registry` fields for new code; those fields are kept for
         /// backward-compatibility with existing callers.
         deps: ContainerConfig,
+
+        /// Circuit breakers for external calls
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
+        /// Circuit breaker configuration
+        external_call_config: CircuitBreakerConfig,
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
@@ -1262,6 +1312,8 @@ pub mod propchain_contracts {
                     at
                 },
                 deps: ContainerConfig::new(),
+                external_call_breakers: Mapping::default(),
+                external_call_config: CircuitBreakerConfig::default(),
                 cached_analytics: CachedAnalytics::default(),
                 load_metrics: LoadMetrics::default(),
                 reentrancy_guard: ReentrancyGuard::new(),

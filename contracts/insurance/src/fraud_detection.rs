@@ -8,12 +8,12 @@ pub mod fraud_detection {
     use super::*;
 
     // Fraud detection constants
-    const HIGH_FRAUD_RISK_THRESHOLD: u32 = 700;      // Score threshold for high risk
-    const MEDIUM_FRAUD_RISK_THRESHOLD: u32 = 450;    // Score threshold for medium risk
-    const CLAIMS_SHORT_PERIOD_DAYS: u64 = 30;        // Days window for multiple claims
+    const HIGH_FRAUD_RISK_THRESHOLD: u32 = 700; // Score threshold for high risk
+    const MEDIUM_FRAUD_RISK_THRESHOLD: u32 = 450; // Score threshold for medium risk
+    const CLAIMS_SHORT_PERIOD_DAYS: u64 = 30; // Days window for multiple claims
     const CLAIMS_SHORT_PERIOD_SECONDS: u64 = CLAIMS_SHORT_PERIOD_DAYS * 86_400;
     const SUSPICIOUS_TIME_WEEKEND_THRESHOLD: u32 = 200; // Extra points for weekend claims
-    const ANOMALOUS_CLAIM_MULTIPLIER: u32 = 150;        // 150% of average
+    const ANOMALOUS_CLAIM_MULTIPLIER: u32 = 150; // 150% of average
     const HIGH_RISK_FRAUD_SCORE: u32 = 200;
 
     /// Detect multiple claims in a short time period
@@ -196,11 +196,11 @@ pub mod fraud_detection {
     /// Determine fraud risk level from score
     pub fn score_to_fraud_risk_level(score: u32) -> crate::types::RiskLevel {
         match score {
-            0..=250 => crate::types::RiskLevel::VeryLow,      // Very low fraud risk
-            251..=450 => crate::types::RiskLevel::Low,        // Low fraud risk
-            451..=600 => crate::types::RiskLevel::Medium,     // Medium fraud risk
-            601..=800 => crate::types::RiskLevel::High,       // High fraud risk
-            _ => crate::types::RiskLevel::VeryHigh,           // Very high fraud risk
+            0..=250 => crate::types::RiskLevel::VeryLow, // Very low fraud risk
+            251..=450 => crate::types::RiskLevel::Low,   // Low fraud risk
+            451..=600 => crate::types::RiskLevel::Medium, // Medium fraud risk
+            601..=800 => crate::types::RiskLevel::High,  // High fraud risk
+            _ => crate::types::RiskLevel::VeryHigh,      // Very high fraud risk
         }
     }
 
@@ -227,11 +227,13 @@ mod tests {
 
     #[test]
     fn test_multiple_claims_detection() {
-        let (detected, score) = fraud_detection::detect_multiple_claims_short_period(3, Some(10_000));
+        let (detected, score) =
+            fraud_detection::detect_multiple_claims_short_period(3, Some(10_000));
         assert!(detected);
         assert_eq!(score, 300);
 
-        let (detected, score) = fraud_detection::detect_multiple_claims_short_period(1, Some(10_000));
+        let (detected, score) =
+            fraud_detection::detect_multiple_claims_short_period(1, Some(10_000));
         assert!(!detected);
     }
 

@@ -207,9 +207,11 @@ mod fractional {
         #[ink(message)]
         pub fn mint_shares(&mut self, owner: AccountId, token_id: u64, amount: u128) {
             let current = self.balances.get(&(owner, token_id)).unwrap_or(0);
-            self.balances.insert(&(owner, token_id), &current.saturating_add(amount));
+            self.balances
+                .insert(&(owner, token_id), &current.saturating_add(amount));
             let total = self.total_shares.get(&token_id).unwrap_or(0);
-            self.total_shares.insert(&token_id, &total.saturating_add(amount));
+            self.total_shares
+                .insert(&token_id, &total.saturating_add(amount));
         }
 
         /// Get the share balance of an owner for a given token
@@ -450,8 +452,16 @@ mod fractional {
         fn test_aggregate_portfolio() {
             let f = Fractional::new();
             let items = vec![
-                PortfolioItem { token_id: 1, shares: 10, price_per_share: 5 },
-                PortfolioItem { token_id: 2, shares: 20, price_per_share: 3 },
+                PortfolioItem {
+                    token_id: 1,
+                    shares: 10,
+                    price_per_share: 5,
+                },
+                PortfolioItem {
+                    token_id: 2,
+                    shares: 20,
+                    price_per_share: 3,
+                },
             ];
             let agg = f.aggregate_portfolio(items);
             assert_eq!(agg.total_value, 110);

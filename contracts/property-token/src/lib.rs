@@ -495,6 +495,8 @@ pub mod property_token {
         #[ink(topic)]
         pub account: AccountId,
         pub status: bool,
+    }
+
     // --- Staking Events ---
     #[ink(event)]
     pub struct SharesStaked {

@@ -1248,16 +1248,14 @@ mod propchain_insurance {
             };
 
             // Get existing claims history for this property
-            let claims = self
-                .property_policies
-                .get(&property_id)
-                .unwrap_or_default();
+            let claims = self.property_policies.get(&property_id).unwrap_or_default();
             let mut historical_claims_count = 0u32;
             let mut historical_claims_amount = 0u128;
 
             for policy_id in claims.iter() {
                 if let Some(policy) = self.policies.get(policy_id) {
-                    historical_claims_count = historical_claims_count.saturating_add(policy.claims_count);
+                    historical_claims_count =
+                        historical_claims_count.saturating_add(policy.claims_count);
                     historical_claims_amount =
                         historical_claims_amount.saturating_add(policy.total_claimed);
                 }
@@ -1384,7 +1382,8 @@ mod propchain_insurance {
             );
 
             let new_risk_level = risk_model::score_to_risk_level(new_overall_score);
-            let new_premium_multiplier = risk_model::calculate_premium_multiplier(new_overall_score);
+            let new_premium_multiplier =
+                risk_model::calculate_premium_multiplier(new_overall_score);
 
             // Update model
             risk_model.age_risk_score = age_risk_score;
@@ -1440,8 +1439,10 @@ mod propchain_insurance {
             let mut detected_indicators = Vec::new();
 
             // 1. Check for multiple claims in short period
-            let policyholder_claims =
-                self.policyholder_policies.get(&claim.claimant).unwrap_or_default();
+            let policyholder_claims = self
+                .policyholder_policies
+                .get(&claim.claimant)
+                .unwrap_or_default();
             let time_since_last = if let Some(&last_claim_id) = policyholder_claims.last() {
                 if let Some(last_claim) = self.claims.get(&last_claim_id) {
                     Some(now.saturating_sub(last_claim.submitted_at))
@@ -1452,8 +1453,10 @@ mod propchain_insurance {
                 None
             };
 
-            let (detected, score) =
-                fraud_detection::detect_multiple_claims_short_period(policyholder_claims.len() as u32, time_since_last);
+            let (detected, score) = fraud_detection::detect_multiple_claims_short_period(
+                policyholder_claims.len() as u32,
+                time_since_last,
+            );
             if detected {
                 fraud_scores.push(score);
                 detected_indicators.push(FraudIndicator::MultipleClaimsShortPeriod);
@@ -1484,8 +1487,10 @@ mod propchain_insurance {
             }
 
             // 4. Check for excessive coverage ratio
-            let (detected, score) =
-                fraud_detection::detect_excessive_coverage_ratio(claim.claim_amount, policy.coverage_amount);
+            let (detected, score) = fraud_detection::detect_excessive_coverage_ratio(
+                claim.claim_amount,
+                policy.coverage_amount,
+            );
             if detected {
                 fraud_scores.push(score);
                 detected_indicators.push(FraudIndicator::ExcessiveCoverageRatio);
@@ -1503,8 +1508,10 @@ mod propchain_insurance {
             }
 
             // 6. Check for misrepresentation
-            let (detected, score) =
-                fraud_detection::detect_misrepresentation(claim.description.len() as u32, !claim.evidence_url.is_empty());
+            let (detected, score) = fraud_detection::detect_misrepresentation(
+                claim.description.len() as u32,
+                !claim.evidence_url.is_empty(),
+            );
             if detected {
                 fraud_scores.push(score);
                 detected_indicators.push(FraudIndicator::Misrepresentation);
@@ -1513,8 +1520,10 @@ mod propchain_insurance {
             // Calculate total fraud risk score
             let fraud_score = fraud_detection::calculate_fraud_risk_score(&fraud_scores);
             let fraud_level = fraud_detection::score_to_fraud_risk_level(fraud_score);
-            let requires_manual_review =
-                fraud_detection::requires_manual_review(fraud_score, detected_indicators.len() as u32);
+            let requires_manual_review = fraud_detection::requires_manual_review(
+                fraud_score,
+                detected_indicators.len() as u32,
+            );
 
             // Create assessment
             let assessment_id = self.fraud_assessment_count + 1;
@@ -1567,7 +1576,8 @@ mod propchain_insurance {
                 if fraud_score > fraud_detection::get_high_fraud_risk_threshold() {
                     stats.high_risk_claims = stats.high_risk_claims.saturating_add(1);
                 }
-                stats.average_fraud_score = (stats.average_fraud_score * (stats.total_assessments - 1) as u32
+                stats.average_fraud_score = (stats.average_fraud_score
+                    * (stats.total_assessments - 1) as u32
                     + fraud_score)
                     / stats.total_assessments as u32;
                 stats.last_update = now;
