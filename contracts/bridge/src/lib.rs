@@ -158,6 +158,22 @@ mod bridge {
         pub rolled_back_at: u32,
     }
 
+    /// Emitted whenever the per-chain status of a cross-chain transaction
+    /// changes (creation, leg confirmation, failure, etc.). Off-chain
+    /// indexers can subscribe to this event to mirror full bridge state.
+    #[ink(event)]
+    pub struct CrossChainTxStatusUpdated {
+        #[ink(topic)]
+        pub request_id: u64,
+        #[ink(topic)]
+        pub chain_id: ChainId,
+        pub status: ChainTxStatus,
+        pub overall_status: BridgeOperationStatus,
+        pub tx_hash: Option<Hash>,
+        pub confirmations: u32,
+        pub timestamp: u64,
+    }
+
     impl PropertyBridge {
         /// Creates a new PropertyBridge contract
         #[ink(constructor)]
@@ -190,6 +206,8 @@ mod bridge {
                 chain_info: Mapping::default(),
                 verified_transactions: Mapping::default(),
                 cross_chain_trades: Mapping::default(),
+                cross_chain_tx_status: Mapping::default(),
+                tx_hash_index: Mapping::default(),
                 bridge_operators: vec![caller],
                 validators: Vec::new(),
                 request_counter: 0,
@@ -284,6 +302,16 @@ mod bridge {
             };
 
             self.bridge_requests.insert(request_id, &request);
+
+            // Initialize cross-chain transaction status: source leg starts in
+            // `Submitted`, destination leg has `NotStarted` until a relayer
+            // reports inclusion on the destination chain.
+            self.init_cross_chain_status(
+                request_id,
+                token_id,
+                request.source_chain,
+                destination_chain,
+            );
 
             self.env().emit_event(BridgeRequestCreated {
                 request_id,
@@ -440,6 +468,16 @@ mod bridge {
                 // Store transaction verification
                 self.verified_transactions.insert(transaction_hash, &true);
 
+                // Source leg is now confirmed on the local chain; destination
+                // leg moves to `Submitted` (relayer is expected to broadcast
+                // the corresponding tx on the destination chain).
+                self.advance_cross_chain_status_on_execute(
+                    request_id,
+                    request.source_chain,
+                    request.destination_chain,
+                    transaction_hash,
+                );
+
                 // Add to bridge history
                 let mut history = self.bridge_history.get(request.sender).unwrap_or_default();
                 history.push(transaction.clone());
@@ -578,6 +616,15 @@ mod bridge {
                     reason,
                     rolled_back_at: self.env().block_number(),
                 });
+
+                // Mark both source and destination legs as Failed in the
+                // cross-chain tracker so external observers see a terminal
+                // state instead of stale in-flight statuses.
+                self.fail_cross_chain_status(
+                    request_id,
+                    request.source_chain,
+                    request.destination_chain,
+                );
 
                 Ok(())
             })
@@ -962,6 +1009,174 @@ mod bridge {
             Ok(())
         }
 
+        // ── Cross-chain transaction status tracking (TASK 1) ───────────────
+
+        /// Update the per-chain status of an in-flight cross-chain transaction.
+        ///
+        /// Authorized callers (admin or any registered bridge operator) can
+        /// post status reports for either the source or destination chain as
+        /// the transaction progresses. The bridge contract itself records
+        /// updates for the source chain on initiate/execute/rollback; this
+        /// message is primarily intended for relayers reporting on the
+        /// destination chain.
+        ///
+        /// `chain_id` must match either the source or destination chain of
+        /// the request. The latest snapshot replaces the previous one for
+        /// that leg, and a copy is appended to `history` for audit.
+        #[ink(message)]
+        pub fn update_chain_tx_status(
+            &mut self,
+            request_id: u64,
+            chain_id: ChainId,
+            status: ChainTxStatus,
+            tx_hash: Option<Hash>,
+            block_number: u64,
+            confirmations: u32,
+            error_message: Option<String>,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != self.admin && !self.bridge_operators.contains(&caller) {
+                return Err(Error::Unauthorized);
+            }
+
+            let mut tracker = self
+                .cross_chain_tx_status
+                .get(request_id)
+                .ok_or(Error::TransactionNotFound)?;
+
+            if chain_id != tracker.source_chain && chain_id != tracker.destination_chain {
+                return Err(Error::InvalidChain);
+            }
+
+            // Reject obviously invalid transitions (e.g. moving a Confirmed
+            // leg back to NotStarted/Submitted). Failed → * is allowed only
+            // via the recovery flow, not via status reports.
+            let current = if chain_id == tracker.source_chain {
+                tracker.source_status.status
+            } else {
+                tracker.destination_status.status
+            };
+            if !is_valid_chain_status_transition(current, status) {
+                return Err(Error::InvalidStatusTransition);
+            }
+
+            let timestamp = self.env().block_timestamp();
+            let update = ChainStatusUpdate {
+                chain_id,
+                status,
+                tx_hash,
+                block_number,
+                timestamp,
+                confirmations,
+                error_message,
+            };
+
+            if chain_id == tracker.source_chain {
+                tracker.source_status = update.clone();
+            } else {
+                tracker.destination_status = update.clone();
+            }
+            tracker.history.push(update.clone());
+            tracker.last_updated = timestamp;
+            tracker.overall_status = compute_overall_status(
+                tracker.source_status.status,
+                tracker.destination_status.status,
+            );
+
+            // Index by tx_hash so callers can look up status from any chain.
+            if let Some(hash) = tx_hash {
+                self.tx_hash_index.insert(hash, &request_id);
+            }
+
+            self.cross_chain_tx_status.insert(request_id, &tracker);
+
+            self.env().emit_event(CrossChainTxStatusUpdated {
+                request_id,
+                chain_id,
+                status,
+                overall_status: tracker.overall_status.clone(),
+                tx_hash,
+                confirmations,
+                timestamp,
+            });
+
+            Ok(())
+        }
+
+        /// Convenience message for relayers to mark the destination leg as
+        /// `Confirmed` once the foreign-chain transaction has reached the
+        /// configured confirmation depth.
+        #[ink(message)]
+        pub fn confirm_destination_delivery(
+            &mut self,
+            request_id: u64,
+            destination_tx_hash: Hash,
+            block_number: u64,
+            confirmations: u32,
+        ) -> Result<(), Error> {
+            let tracker = self
+                .cross_chain_tx_status
+                .get(request_id)
+                .ok_or(Error::TransactionNotFound)?;
+            let destination_chain = tracker.destination_chain;
+            self.update_chain_tx_status(
+                request_id,
+                destination_chain,
+                ChainTxStatus::Confirmed,
+                Some(destination_tx_hash),
+                block_number,
+                confirmations,
+                None,
+            )
+        }
+
+        /// Returns the full cross-chain transaction status, including the
+        /// latest snapshot on each chain plus the chronological update log.
+        #[ink(message)]
+        pub fn get_cross_chain_tx_status(
+            &self,
+            request_id: u64,
+        ) -> Option<CrossChainTxStatus> {
+            self.cross_chain_tx_status.get(request_id)
+        }
+
+        /// Returns the latest status snapshot for a specific chain leg of a
+        /// given request. `None` if the request is unknown or the supplied
+        /// `chain_id` is neither the source nor destination of the request.
+        #[ink(message)]
+        pub fn get_chain_status(
+            &self,
+            request_id: u64,
+            chain_id: ChainId,
+        ) -> Option<ChainStatusUpdate> {
+            let tracker = self.cross_chain_tx_status.get(request_id)?;
+            if chain_id == tracker.source_chain {
+                Some(tracker.source_status)
+            } else if chain_id == tracker.destination_chain {
+                Some(tracker.destination_status)
+            } else {
+                None
+            }
+        }
+
+        /// Look up a cross-chain transaction status by any chain-native
+        /// transaction hash that has been reported to the bridge.
+        #[ink(message)]
+        pub fn get_tx_status_by_hash(&self, tx_hash: Hash) -> Option<CrossChainTxStatus> {
+            let request_id = self.tx_hash_index.get(tx_hash)?;
+            self.cross_chain_tx_status.get(request_id)
+        }
+
+        /// Returns the full chronological per-chain update history for a
+        /// request. Useful for off-chain audit and dashboards.
+        #[ink(message)]
+        pub fn get_tx_status_history(&self, request_id: u64) -> Vec<ChainStatusUpdate> {
+            self.cross_chain_tx_status
+                .get(request_id)
+                .map(|t| t.history)
+                .unwrap_or_default()
+        }
+
         // Helper functions
 
         fn is_authorized_for_token(&self, _account: AccountId, _token_id: TokenId) -> bool {
@@ -1052,6 +1267,231 @@ mod bridge {
             }
 
             Ok(())
+        }
+
+        // ── Cross-chain status helper methods ──────────────────────────
+
+        /// Initialize the cross-chain transaction tracker for a new request.
+        /// The source leg is recorded as `Submitted` (the on-chain initiation
+        /// is itself the source-chain submission); the destination leg is
+        /// `NotStarted` until a relayer reports activity on that chain.
+        fn init_cross_chain_status(
+            &mut self,
+            request_id: u64,
+            token_id: TokenId,
+            source_chain: ChainId,
+            destination_chain: ChainId,
+        ) {
+            let timestamp = self.env().block_timestamp();
+            let block_number = u64::from(self.env().block_number());
+
+            let source = ChainStatusUpdate {
+                chain_id: source_chain,
+                status: ChainTxStatus::Submitted,
+                tx_hash: None,
+                block_number,
+                timestamp,
+                confirmations: 0,
+                error_message: None,
+            };
+            let destination = ChainStatusUpdate {
+                chain_id: destination_chain,
+                status: ChainTxStatus::NotStarted,
+                tx_hash: None,
+                block_number: 0,
+                timestamp,
+                confirmations: 0,
+                error_message: None,
+            };
+
+            let mut history = Vec::new();
+            history.push(source.clone());
+
+            let tracker = CrossChainTxStatus {
+                request_id,
+                token_id,
+                source_chain,
+                destination_chain,
+                source_status: source.clone(),
+                destination_status: destination,
+                overall_status: BridgeOperationStatus::Pending,
+                history,
+                last_updated: timestamp,
+            };
+            self.cross_chain_tx_status.insert(request_id, &tracker);
+
+            self.env().emit_event(CrossChainTxStatusUpdated {
+                request_id,
+                chain_id: source_chain,
+                status: ChainTxStatus::Submitted,
+                overall_status: BridgeOperationStatus::Pending,
+                tx_hash: None,
+                confirmations: 0,
+                timestamp,
+            });
+        }
+
+        /// Advance the tracker on successful `execute_bridge`: source leg is
+        /// `Confirmed` (with the generated tx_hash), destination leg moves
+        /// to `Submitted` awaiting relayer confirmation.
+        fn advance_cross_chain_status_on_execute(
+            &mut self,
+            request_id: u64,
+            source_chain: ChainId,
+            destination_chain: ChainId,
+            tx_hash: Hash,
+        ) {
+            let mut tracker = match self.cross_chain_tx_status.get(request_id) {
+                Some(t) => t,
+                // Defensive: should always exist (init on initiate), but if
+                // a record is somehow missing we silently no-op rather than
+                // panic the execute flow.
+                None => return,
+            };
+            let timestamp = self.env().block_timestamp();
+            let block_number = u64::from(self.env().block_number());
+
+            let source_update = ChainStatusUpdate {
+                chain_id: source_chain,
+                status: ChainTxStatus::Confirmed,
+                tx_hash: Some(tx_hash),
+                block_number,
+                timestamp,
+                confirmations: 1,
+                error_message: None,
+            };
+            let destination_update = ChainStatusUpdate {
+                chain_id: destination_chain,
+                status: ChainTxStatus::Submitted,
+                tx_hash: None,
+                block_number: 0,
+                timestamp,
+                confirmations: 0,
+                error_message: None,
+            };
+
+            tracker.source_status = source_update.clone();
+            tracker.destination_status = destination_update.clone();
+            tracker.history.push(source_update);
+            tracker.history.push(destination_update);
+            tracker.last_updated = timestamp;
+            tracker.overall_status = BridgeOperationStatus::InTransit;
+
+            // Record the source-chain tx hash in the reverse index.
+            self.tx_hash_index.insert(tx_hash, &request_id);
+
+            self.cross_chain_tx_status.insert(request_id, &tracker);
+
+            self.env().emit_event(CrossChainTxStatusUpdated {
+                request_id,
+                chain_id: source_chain,
+                status: ChainTxStatus::Confirmed,
+                overall_status: BridgeOperationStatus::InTransit,
+                tx_hash: Some(tx_hash),
+                confirmations: 1,
+                timestamp,
+            });
+        }
+
+        /// Mark both legs as failed on rollback so dashboards observe a
+        /// terminal state instead of a stale in-flight status.
+        fn fail_cross_chain_status(
+            &mut self,
+            request_id: u64,
+            source_chain: ChainId,
+            destination_chain: ChainId,
+        ) {
+            let mut tracker = match self.cross_chain_tx_status.get(request_id) {
+                Some(t) => t,
+                None => return,
+            };
+            let timestamp = self.env().block_timestamp();
+            let block_number = u64::from(self.env().block_number());
+
+            // Only mark a leg as Failed if it isn't already in a terminal
+            // success state (Confirmed). This preserves accurate per-chain
+            // history when only one side failed.
+            if tracker.source_status.status != ChainTxStatus::Confirmed {
+                let upd = ChainStatusUpdate {
+                    chain_id: source_chain,
+                    status: ChainTxStatus::Failed,
+                    tx_hash: tracker.source_status.tx_hash,
+                    block_number,
+                    timestamp,
+                    confirmations: tracker.source_status.confirmations,
+                    error_message: Some(String::from("Bridge rollback")),
+                };
+                tracker.source_status = upd.clone();
+                tracker.history.push(upd);
+            }
+            if tracker.destination_status.status != ChainTxStatus::Confirmed {
+                let upd = ChainStatusUpdate {
+                    chain_id: destination_chain,
+                    status: ChainTxStatus::Failed,
+                    tx_hash: tracker.destination_status.tx_hash,
+                    block_number,
+                    timestamp,
+                    confirmations: tracker.destination_status.confirmations,
+                    error_message: Some(String::from("Bridge rollback")),
+                };
+                tracker.destination_status = upd.clone();
+                tracker.history.push(upd);
+            }
+            tracker.last_updated = timestamp;
+            tracker.overall_status = BridgeOperationStatus::Failed;
+            self.cross_chain_tx_status.insert(request_id, &tracker);
+
+            self.env().emit_event(CrossChainTxStatusUpdated {
+                request_id,
+                chain_id: source_chain,
+                status: ChainTxStatus::Failed,
+                overall_status: BridgeOperationStatus::Failed,
+                tx_hash: None,
+                confirmations: 0,
+                timestamp,
+            });
+        }
+    }
+
+    /// Free helper: validate per-chain status transitions.
+    ///
+    /// Allowed transitions (forward progress only):
+    ///   NotStarted → {Submitted, Failed}
+    ///   Submitted  → {Submitted, Confirming, Confirmed, Failed}
+    ///   Confirming → {Confirming, Confirmed, Failed}
+    ///   Confirmed  → {Confirmed}            (terminal-success; only confirmation count may change)
+    ///   Failed     → {Failed}               (terminal-failure)
+    fn is_valid_chain_status_transition(from: ChainTxStatus, to: ChainTxStatus) -> bool {
+        use ChainTxStatus::*;
+        match (from, to) {
+            (NotStarted, Submitted)
+            | (NotStarted, Failed)
+            | (Submitted, Submitted)
+            | (Submitted, Confirming)
+            | (Submitted, Confirmed)
+            | (Submitted, Failed)
+            | (Confirming, Confirming)
+            | (Confirming, Confirmed)
+            | (Confirming, Failed)
+            | (Confirmed, Confirmed)
+            | (Failed, Failed) => true,
+            _ => false,
+        }
+    }
+
+    /// Free helper: derive the aggregated `BridgeOperationStatus` from the
+    /// individual per-chain statuses.
+    fn compute_overall_status(
+        source: ChainTxStatus,
+        destination: ChainTxStatus,
+    ) -> BridgeOperationStatus {
+        use ChainTxStatus::*;
+        match (source, destination) {
+            (Failed, _) | (_, Failed) => BridgeOperationStatus::Failed,
+            (Confirmed, Confirmed) => BridgeOperationStatus::Completed,
+            (Confirmed, _) => BridgeOperationStatus::InTransit,
+            (Submitted, NotStarted) | (Confirming, NotStarted) => BridgeOperationStatus::Pending,
+            _ => BridgeOperationStatus::InTransit,
         }
     }
 }

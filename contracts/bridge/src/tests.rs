@@ -360,4 +360,279 @@ mod tests {
             first
         );
     }
+
+    // ── TASK 1: Cross-chain transaction status tracking ─────────────────
+
+    fn make_metadata() -> PropertyMetadata {
+        PropertyMetadata {
+            location: String::from("Test Property"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 100_000,
+            documents_url: String::from("ipfs://test"),
+        }
+    }
+
+    #[ink::test]
+    fn cross_chain_status_initialized_on_initiate() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), make_metadata())
+            .expect("initiate should succeed");
+
+        let tracker = bridge
+            .get_cross_chain_tx_status(request_id)
+            .expect("tracker should exist after initiate");
+        assert_eq!(tracker.request_id, request_id);
+        assert_eq!(tracker.destination_chain, 2);
+        assert_eq!(tracker.source_status.status, ChainTxStatus::Submitted);
+        assert_eq!(tracker.destination_status.status, ChainTxStatus::NotStarted);
+        assert_eq!(tracker.overall_status, BridgeOperationStatus::Pending);
+        assert_eq!(tracker.history.len(), 1);
+    }
+
+    #[ink::test]
+    fn update_chain_tx_status_advances_destination_leg() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), make_metadata())
+            .expect("initiate should succeed");
+
+        // Alice (admin/operator) reports the destination leg progressing.
+        bridge
+            .update_chain_tx_status(
+                request_id,
+                2, // destination chain
+                ChainTxStatus::Submitted,
+                None,
+                100,
+                0,
+                None,
+            )
+            .expect("first update should succeed");
+        bridge
+            .update_chain_tx_status(
+                request_id,
+                2,
+                ChainTxStatus::Confirming,
+                None,
+                101,
+                3,
+                None,
+            )
+            .expect("confirming update should succeed");
+
+        let dest = bridge
+            .get_chain_status(request_id, 2)
+            .expect("destination status");
+        assert_eq!(dest.status, ChainTxStatus::Confirming);
+        assert_eq!(dest.confirmations, 3);
+
+        let history = bridge.get_tx_status_history(request_id);
+        assert!(history.len() >= 3, "history must record every update");
+    }
+
+    #[ink::test]
+    fn confirm_destination_delivery_completes_overall_status() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.add_validator(accounts.alice).expect("add validator");
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, None, make_metadata())
+            .expect("initiate");
+
+        bridge.sign_bridge_request(request_id, true).expect("sign");
+        // Need a second signature to reach min_signatures_required = 2.
+        bridge
+            .add_validator(accounts.charlie)
+            .expect("add second validator");
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("second sign");
+
+        // Alice is also an operator (constructor caller); execute the bridge.
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge.execute_bridge(request_id).expect("execute");
+
+        // After execute: source = Confirmed, destination = Submitted, overall = InTransit.
+        let mid = bridge
+            .get_cross_chain_tx_status(request_id)
+            .expect("tracker");
+        assert_eq!(mid.source_status.status, ChainTxStatus::Confirmed);
+        assert_eq!(mid.destination_status.status, ChainTxStatus::Submitted);
+        assert_eq!(mid.overall_status, BridgeOperationStatus::InTransit);
+
+        // Relayer confirms destination delivery.
+        let dest_hash = ink::primitives::Hash::from([7u8; 32]);
+        bridge
+            .confirm_destination_delivery(request_id, dest_hash, 200, 12)
+            .expect("confirm destination");
+
+        let final_status = bridge
+            .get_cross_chain_tx_status(request_id)
+            .expect("tracker");
+        assert_eq!(
+            final_status.destination_status.status,
+            ChainTxStatus::Confirmed
+        );
+        assert_eq!(
+            final_status.overall_status,
+            BridgeOperationStatus::Completed
+        );
+        // Tx hash reverse lookup should now resolve.
+        let by_hash = bridge
+            .get_tx_status_by_hash(dest_hash)
+            .expect("lookup by destination hash");
+        assert_eq!(by_hash.request_id, request_id);
+    }
+
+    #[ink::test]
+    fn invalid_chain_id_rejected() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, None, make_metadata())
+            .expect("initiate");
+
+        let err = bridge
+            .update_chain_tx_status(
+                request_id,
+                999, // not source nor destination
+                ChainTxStatus::Submitted,
+                None,
+                0,
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::InvalidChain);
+    }
+
+    #[ink::test]
+    fn invalid_status_transition_rejected() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, None, make_metadata())
+            .expect("initiate");
+
+        // Move destination Submitted → Confirmed.
+        bridge
+            .update_chain_tx_status(
+                request_id,
+                2,
+                ChainTxStatus::Submitted,
+                None,
+                100,
+                0,
+                None,
+            )
+            .expect("submitted");
+        bridge
+            .update_chain_tx_status(
+                request_id,
+                2,
+                ChainTxStatus::Confirmed,
+                None,
+                101,
+                12,
+                None,
+            )
+            .expect("confirmed");
+
+        // Confirmed → Submitted must be rejected.
+        let err = bridge
+            .update_chain_tx_status(
+                request_id,
+                2,
+                ChainTxStatus::Submitted,
+                None,
+                102,
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::InvalidStatusTransition);
+    }
+
+    #[ink::test]
+    fn unauthorized_caller_cannot_update_status() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, None, make_metadata())
+            .expect("initiate");
+
+        // Bob is neither admin nor operator.
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let err = bridge
+            .update_chain_tx_status(
+                request_id,
+                2,
+                ChainTxStatus::Submitted,
+                None,
+                0,
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::Unauthorized);
+    }
+
+    #[ink::test]
+    fn rollback_marks_both_legs_failed() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, None, make_metadata())
+            .expect("initiate");
+
+        bridge
+            .rollback_bridge_transaction(request_id, String::from("manual rollback"))
+            .expect("rollback");
+
+        let tracker = bridge
+            .get_cross_chain_tx_status(request_id)
+            .expect("tracker");
+        assert_eq!(tracker.source_status.status, ChainTxStatus::Failed);
+        assert_eq!(tracker.destination_status.status, ChainTxStatus::Failed);
+        assert_eq!(tracker.overall_status, BridgeOperationStatus::Failed);
+    }
+
+    #[ink::test]
+    fn unknown_request_returns_transaction_not_found() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        let err = bridge
+            .update_chain_tx_status(
+                999_999,
+                2,
+                ChainTxStatus::Submitted,
+                None,
+                0,
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::TransactionNotFound);
+    }
 }
