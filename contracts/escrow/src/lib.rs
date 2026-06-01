@@ -68,6 +68,10 @@ mod propchain_escrow {
         very_large_transfer_threshold: u128,
         /// Tax compliance contract address
         tax_compliance_contract: Option<AccountId>,
+        /// Escrow fee rate in basis points (e.g. 100 = 1%)
+        fee_rate_bps: u16,
+        /// Fee recipient account
+        fee_recipient: Option<AccountId>,
     }
 
     // Events
@@ -168,6 +172,32 @@ mod propchain_escrow {
         admin: AccountId,
     }
 
+    #[ink(event)]
+    pub struct FeeCollected {
+        #[ink(topic)]
+        escrow_id: u64,
+        #[ink(topic)]
+        fee_recipient: AccountId,
+        fee_amount: u128,
+        fee_rate_bps: u16,
+    }
+
+    #[ink(event)]
+    pub struct FeeRateUpdated {
+        #[ink(topic)]
+        updated_by: AccountId,
+        old_rate: u16,
+        new_rate: u16,
+    }
+
+    #[ink(event)]
+    pub struct FeeRecipientUpdated {
+        #[ink(topic)]
+        updated_by: AccountId,
+        old_recipient: Option<AccountId>,
+        new_recipient: Option<AccountId>,
+    }
+
     // ── Large-Transfer Multi-Step Approval Events ────────────────────────────
 
     /// Emitted when a large-transfer approval request is created.
@@ -244,6 +274,8 @@ mod propchain_escrow {
                 large_transfer_threshold: 0,
                 very_large_transfer_threshold: 0,
                 tax_compliance_contract,
+                fee_rate_bps: 0,
+                fee_recipient: None,
             }
         }
 
@@ -456,6 +488,30 @@ mod propchain_escrow {
                     }
                 }
                 // ── End Tax Withholding ──────────────────────────────────────
+
+                // ── Fee Deduction ───────────────────────────────────────────
+                let fee = if self.fee_rate_bps > 0 && self.fee_recipient.is_some() {
+                    let calculated = final_transfer_amount
+                        .saturating_mul(self.fee_rate_bps as u128)
+                        / 10_000;
+                    if calculated > 0 {
+                        let recipient = self.fee_recipient.unwrap();
+                        if self.env().transfer(recipient, calculated).is_err() {
+                            return Err(Error::InvalidFeeAmount);
+                        }
+                        self.env().emit_event(FeeCollected {
+                            escrow_id,
+                            fee_recipient: recipient,
+                            fee_amount: calculated,
+                            fee_rate_bps: self.fee_rate_bps,
+                        });
+                    }
+                    calculated
+                } else {
+                    0
+                };
+                final_transfer_amount = final_transfer_amount.saturating_sub(fee);
+                // ── End Fee Deduction ───────────────────────────────────────
 
                 // Transfer remaining funds to seller
                 if self
@@ -1517,6 +1573,61 @@ mod propchain_escrow {
         #[ink(message)]
         pub fn get_high_value_threshold(&self) -> u128 {
             self.min_high_value_threshold
+        }
+
+        // ── Fee Configuration Messages ──────────────────────────────────────
+
+        /// Set the escrow fee rate (admin only). Rate is in basis points, max 1000 (10%).
+        #[ink(message)]
+        pub fn set_fee_rate(&mut self, rate_bps: u16) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            if rate_bps > 1000 {
+                return Err(Error::FeeRateTooHigh);
+            }
+            let old_rate = self.fee_rate_bps;
+            self.fee_rate_bps = rate_bps;
+            self.env().emit_event(FeeRateUpdated {
+                updated_by: self.env().caller(),
+                old_rate,
+                new_rate: rate_bps,
+            });
+            Ok(())
+        }
+
+        /// Set the fee recipient account (admin only).
+        #[ink(message)]
+        pub fn set_fee_recipient(&mut self, recipient: Option<AccountId>) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let old_recipient = self.fee_recipient;
+            self.fee_recipient = recipient;
+            self.env().emit_event(FeeRecipientUpdated {
+                updated_by: self.env().caller(),
+                old_recipient,
+                new_recipient: recipient,
+            });
+            Ok(())
+        }
+
+        /// Get the current fee configuration.
+        #[ink(message)]
+        pub fn get_fee_config(&self) -> (u16, Option<AccountId>) {
+            (self.fee_rate_bps, self.fee_recipient)
+        }
+
+        /// Calculate the fee for a given amount using the current fee rate.
+        #[ink(message)]
+        pub fn calculate_fee(&self, amount: u128) -> Result<u128, Error> {
+            if self.fee_rate_bps == 0 || self.fee_recipient.is_none() {
+                return Ok(0);
+            }
+            let fee = amount
+                .saturating_mul(self.fee_rate_bps as u128)
+                / 10_000;
+            Ok(fee)
         }
 
         // Helper functions
