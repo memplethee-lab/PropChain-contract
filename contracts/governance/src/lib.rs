@@ -93,6 +93,26 @@ mod governance {
         pub executed_at: u64,
     }
 
+    /// Emitted when a proposal template is created.
+    #[ink(event)]
+    pub struct TemplateCreated {
+        #[ink(topic)]
+        pub template_id: u64,
+        pub name: String,
+        pub action_type: GovernanceAction,
+        pub created_by: AccountId,
+    }
+
+    /// Emitted when a proposal is created from a template.
+    #[ink(event)]
+    pub struct ProposalFromTemplate {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub template_id: u64,
+        pub proposer: AccountId,
+    }
+
     // =========================================================================
     // Storage
     // =========================================================================
@@ -123,6 +143,13 @@ mod governance {
         auto_execute_enabled: Mapping<u64, bool>,
         /// Global automation toggle (admin can pause all auto-execution)
         automation_paused: bool,
+        // ── Proposal Template System (Issue #230) ─────────────────────────────
+        /// Templates: template_id -> ProposalTemplate
+        templates: Mapping<u64, ProposalTemplate>,
+        /// Template ID counter
+        template_counter: u64,
+        /// List of all template IDs
+        template_ids: Vec<u64>,
     }
 
     // =========================================================================
@@ -164,6 +191,9 @@ mod governance {
                 delegation_expiry: Mapping::default(),
                 auto_execute_enabled: Mapping::default(),
                 automation_paused: false,
+                templates: Mapping::default(),
+                template_counter: 0,
+                template_ids: Vec::new(),
             }
         }
 
@@ -644,6 +674,122 @@ mod governance {
             }
 
             Ok(())
+        }
+
+        // ── Proposal Template System (Issue #230) ────────────────────────────
+
+        /// Create a reusable proposal template. Only signers may create templates.
+        #[ink(message)]
+        pub fn create_template(
+            &mut self,
+            name: String,
+            description: String,
+            action_type: GovernanceAction,
+            default_target: Option<AccountId>,
+            is_emergency: bool,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            if name.is_empty() {
+                return Err(Error::InvalidThreshold);
+            }
+
+            let template_id = self.template_counter;
+            self.template_counter = self.template_counter.saturating_add(1);
+
+            let template = ProposalTemplate {
+                id: template_id,
+                name: name.clone(),
+                description: description.clone(),
+                action_type: action_type.clone(),
+                default_target,
+                is_emergency,
+                created_by: caller,
+                is_active: true,
+            };
+
+            self.templates.insert(&template_id, &template);
+            self.template_ids.push(template_id);
+
+            self.env().emit_event(TemplateCreated {
+                template_id,
+                name,
+                action_type,
+                created_by: caller,
+            });
+
+            Ok(template_id)
+        }
+
+        /// Get a template by ID.
+        #[ink(message)]
+        pub fn get_template(&self, template_id: u64) -> Option<ProposalTemplate> {
+            self.templates.get(&template_id)
+        }
+
+        /// Get all template IDs.
+        #[ink(message)]
+        pub fn get_template_ids(&self) -> Vec<u64> {
+            self.template_ids.clone()
+        }
+
+        /// Get all templates (paginated).
+        #[ink(message)]
+        pub fn get_all_templates(&self, page: u32, page_size: u32) -> Vec<ProposalTemplate> {
+            let start = (page as usize).saturating_mul(page_size as usize);
+            self.template_ids
+                .iter()
+                .skip(start)
+                .take(page_size as usize)
+                .filter_map(|id| self.templates.get(id))
+                .collect()
+        }
+
+        /// Toggle a template's active status. Admin only.
+        #[ink(message)]
+        pub fn set_template_active(
+            &mut self,
+            template_id: u64,
+            is_active: bool,
+        ) -> Result<(), Error> {
+            self.ensure_admin()?;
+            let mut template = self
+                .templates
+                .get(&template_id)
+                .ok_or(Error::ProposalNotFound)?;
+            template.is_active = is_active;
+            self.templates.insert(&template_id, &template);
+            Ok(())
+        }
+
+        /// Create a proposal from a template, filling in the description hash.
+        /// The action_type and is_emergency are taken from the template.
+        #[ink(message)]
+        pub fn create_proposal_from_template(
+            &mut self,
+            template_id: u64,
+            description_hash: Hash,
+            target_override: Option<AccountId>,
+        ) -> Result<u64, Error> {
+            let template = self
+                .templates
+                .get(&template_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if !template.is_active {
+                return Err(Error::ProposalClosed);
+            }
+
+            let target = target_override.or(template.default_target);
+
+            if template.is_emergency {
+                self.create_emergency_proposal(description_hash, template.action_type, target)
+            } else {
+                let proposal_id =
+                    self.create_proposal(description_hash, template.action_type, target)?;
+                Ok(proposal_id)
+            }
         }
 
         // ── Delegation Messages (Issue #231) ─────────────────────────────────
