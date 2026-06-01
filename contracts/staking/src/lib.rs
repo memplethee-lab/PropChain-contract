@@ -139,6 +139,93 @@ mod staking {
     // Storage
     // =========================================================================
 
+    // =========================================================================
+    // Delegation Events
+    // =========================================================================
+
+    #[ink(event)]
+    pub struct ValidatorRegistered {
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub self_stake: u128,
+        pub commission_rate: u32,
+    }
+
+    #[ink(event)]
+    pub struct CommissionRateUpdated {
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub old_rate: u32,
+        pub new_rate: u32,
+    }
+
+    #[ink(event)]
+    pub struct StakeDelegated {
+        #[ink(topic)]
+        pub delegator: AccountId,
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct UndelegationInitiated {
+        #[ink(topic)]
+        pub delegator: AccountId,
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub amount: u128,
+        pub claimable_at: u64,
+    }
+
+    #[ink(event)]
+    pub struct UndelegatedTokensClaimed {
+        #[ink(topic)]
+        pub delegator: AccountId,
+        pub amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct DelegationRewardsClaimed {
+        #[ink(topic)]
+        pub delegator: AccountId,
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct ValidatorCommissionClaimed {
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct ValidatorSlashed {
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub slash_amount: u128,
+        pub delegated_reduction: u128,
+    }
+
+    #[ink(event)]
+    pub struct ValidatorDeactivated {
+        #[ink(topic)]
+        pub validator: AccountId,
+        pub reason: DeactivationReason,
+    }
+
+    #[ink(event)]
+    pub struct ValidatorReactivated {
+        #[ink(topic)]
+        pub validator: AccountId,
+    }
+
+    // =========================================================================
+    // Storage
+    // =========================================================================
+
     #[ink(storage)]
     pub struct Staking {
         admin: AccountId,
@@ -832,6 +919,505 @@ pub fn get_early_withdrawal_penalty_bps(&self) -> u128 {
             } else {
                 self.governance_power.insert(power_holder, &new_power);
             }
+        }
+
+        // =========================================================================
+        // Delegated Staking — Internal Helpers
+        // =========================================================================
+
+        /// Sync the per-validator reward accumulator up to the current block.
+        /// Must be called before any state mutation that touches a validator's
+        /// reward state.
+        fn update_validator_rewards(&mut self, validator: AccountId) {
+            let mut info = match self.validators.get(validator) {
+                Some(v) => v,
+                None => return,
+            };
+            let now = self.env().block_number() as u64;
+            let blocks = (now as u128).saturating_sub(info.last_reward_block as u128);
+            if blocks == 0 || info.total_delegated == 0 {
+                info.last_reward_block = now;
+                self.validators.insert(validator, &info);
+                return;
+            }
+            // gross reward for the delegated pool over elapsed blocks
+            let gross_reward = info
+                .total_delegated
+                .saturating_mul(self.reward_rate_bps)
+                .saturating_mul(blocks)
+                / constants::REWARD_RATE_PRECISION
+                / 5_256_000; // blocks per year
+
+            let commission = gross_reward
+                .saturating_mul(info.commission_rate as u128)
+                / BPS_DENOMINATOR as u128;
+            let net_reward = gross_reward.saturating_sub(commission);
+
+            info.accumulated_commission = info.accumulated_commission.saturating_add(commission);
+            info.acc_reward_per_share = info.acc_reward_per_share.saturating_add(
+                net_reward
+                    .saturating_mul(REWARD_PRECISION)
+                    / info.total_delegated,
+            );
+            info.last_reward_block = now;
+            self.validators.insert(validator, &info);
+        }
+
+        /// Project the pending delegation reward for a record without writing state.
+        fn pending_delegation_reward(
+            &self,
+            record: &DelegationRecord,
+            info: &ValidatorInfo,
+        ) -> u128 {
+            let now = self.env().block_number() as u64;
+            let blocks = (now as u128).saturating_sub(info.last_reward_block as u128);
+
+            let projected_acc = if info.total_delegated > 0 && blocks > 0 {
+                let gross = info
+                    .total_delegated
+                    .saturating_mul(self.reward_rate_bps)
+                    .saturating_mul(blocks)
+                    / constants::REWARD_RATE_PRECISION
+                    / 5_256_000;
+                let commission = gross
+                    .saturating_mul(info.commission_rate as u128)
+                    / BPS_DENOMINATOR as u128;
+                let net = gross.saturating_sub(commission);
+                info.acc_reward_per_share.saturating_add(
+                    net.saturating_mul(REWARD_PRECISION) / info.total_delegated,
+                )
+            } else {
+                info.acc_reward_per_share
+            };
+
+            (record
+                .amount
+                .saturating_mul(projected_acc)
+                / REWARD_PRECISION)
+                .saturating_sub(record.reward_debt)
+        }
+
+        // =========================================================================
+        // Delegated Staking — Validator Lifecycle
+        // =========================================================================
+
+        /// Register the caller as a validator with a self-stake and commission rate.
+        #[ink(message)]
+        pub fn register_validator(
+            &mut self,
+            self_stake: u128,
+            commission_rate: u32,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if self_stake < MIN_VALIDATOR_STAKE {
+                return Err(Error::InsufficientValidatorStake);
+            }
+            if commission_rate > MAX_COMMISSION_RATE {
+                return Err(Error::InvalidCommissionRate);
+            }
+            if self.validators.contains(caller) {
+                return Err(Error::AlreadyValidator);
+            }
+            let now = self.env().block_number() as u64;
+            let info = ValidatorInfo {
+                self_stake,
+                commission_rate,
+                total_delegated: 0,
+                accumulated_commission: 0,
+                is_active: true,
+                acc_reward_per_share: 0,
+                last_reward_block: now,
+            };
+            self.validators.insert(caller, &info);
+            self.validator_list.push(caller);
+            self.env().emit_event(ValidatorRegistered {
+                validator: caller,
+                self_stake,
+                commission_rate,
+            });
+            Ok(())
+        }
+
+        /// Update the caller's commission rate.
+        #[ink(message)]
+        pub fn update_commission_rate(&mut self, new_rate: u32) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if !self.validators.contains(caller) {
+                return Err(Error::Unauthorized);
+            }
+            if new_rate > MAX_COMMISSION_RATE {
+                return Err(Error::InvalidCommissionRate);
+            }
+            self.update_validator_rewards(caller);
+            let mut info = self.validators.get(caller).unwrap();
+            let old_rate = info.commission_rate;
+            info.commission_rate = new_rate;
+            self.validators.insert(caller, &info);
+            self.env().emit_event(CommissionRateUpdated {
+                validator: caller,
+                old_rate,
+                new_rate,
+            });
+            Ok(())
+        }
+
+        /// Voluntarily deactivate the caller's validator.
+        #[ink(message)]
+        pub fn deactivate_validator(&mut self) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let mut info = self.validators.get(caller).ok_or(Error::Unauthorized)?;
+            info.is_active = false;
+            self.validators.insert(caller, &info);
+            self.env().emit_event(ValidatorDeactivated {
+                validator: caller,
+                reason: DeactivationReason::Voluntary,
+            });
+            Ok(())
+        }
+
+        /// Reactivate an inactive validator.
+        #[ink(message)]
+        pub fn reactivate_validator(&mut self) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let mut info = self.validators.get(caller).ok_or(Error::Unauthorized)?;
+            if info.self_stake < MIN_VALIDATOR_STAKE {
+                return Err(Error::InsufficientValidatorStake);
+            }
+            info.is_active = true;
+            self.validators.insert(caller, &info);
+            self.env().emit_event(ValidatorReactivated { validator: caller });
+            Ok(())
+        }
+
+        /// Admin-only: slash a validator and propagate to all delegators.
+        #[ink(message)]
+        pub fn slash_validator(&mut self, validator: AccountId) -> Result<(), Error> {
+            propchain_traits::non_reentrant!(self, {
+                self.ensure_admin()?;
+                if !self.validators.contains(validator) {
+                    return Err(Error::ValidatorNotFound);
+                }
+
+                self.update_validator_rewards(validator);
+                let mut info = self.validators.get(validator).unwrap();
+
+                // Slash validator self-stake
+                let self_slash = info.self_stake.saturating_mul(SLASH_PERCENT) / 100;
+                info.self_stake = info.self_stake.saturating_sub(self_slash);
+
+                // Slash each delegator
+                let delegators = self
+                    .validator_delegators
+                    .get(validator)
+                    .unwrap_or_default();
+                let mut total_delegated_reduction: u128 = 0;
+                for delegator in &delegators {
+                    let key = (*delegator, validator);
+                    if let Some(mut record) = self.delegations.get(key) {
+                        let d_slash = record.amount.saturating_mul(SLASH_PERCENT) / 100;
+                        record.amount = record.amount.saturating_sub(d_slash);
+                        total_delegated_reduction =
+                            total_delegated_reduction.saturating_add(d_slash);
+                        self.delegations.insert(key, &record);
+                    }
+                }
+
+                info.total_delegated = info
+                    .total_delegated
+                    .saturating_sub(total_delegated_reduction);
+                self.total_delegated_stake = self
+                    .total_delegated_stake
+                    .saturating_sub(total_delegated_reduction);
+
+                let was_active = info.is_active;
+                if info.self_stake < MIN_VALIDATOR_STAKE {
+                    info.is_active = false;
+                }
+                self.validators.insert(validator, &info);
+
+                self.env().emit_event(ValidatorSlashed {
+                    validator,
+                    slash_amount: self_slash,
+                    delegated_reduction: total_delegated_reduction,
+                });
+
+                if was_active && !info.is_active {
+                    self.env().emit_event(ValidatorDeactivated {
+                        validator,
+                        reason: DeactivationReason::Slashed,
+                    });
+                }
+
+                Ok(())
+            })
+        }
+
+        // =========================================================================
+        // Delegated Staking — Delegation Lifecycle
+        // =========================================================================
+
+        /// Delegate `amount` tokens to `validator`.
+        #[ink(message)]
+        pub fn delegate(
+            &mut self,
+            validator: AccountId,
+            amount: u128,
+        ) -> Result<(), Error> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                let info = self
+                    .validators
+                    .get(validator)
+                    .ok_or(Error::ValidatorNotActive)?;
+                if !info.is_active {
+                    return Err(Error::ValidatorNotActive);
+                }
+                if amount < self.min_stake {
+                    return Err(Error::InsufficientAmount);
+                }
+                if self.delegations.contains((caller, validator)) {
+                    return Err(Error::AlreadyDelegated);
+                }
+
+                self.update_validator_rewards(validator);
+                let info = self.validators.get(validator).unwrap();
+
+                let reward_debt = info
+                    .acc_reward_per_share
+                    .saturating_mul(amount)
+                    / REWARD_PRECISION;
+
+                let record = DelegationRecord {
+                    delegator: caller,
+                    validator,
+                    amount,
+                    reward_debt,
+                    unbonding_start: None,
+                };
+                self.delegations.insert((caller, validator), &record);
+
+                // Update secondary indices
+                let mut delegators = self
+                    .validator_delegators
+                    .get(validator)
+                    .unwrap_or_default();
+                delegators.push(caller);
+                self.validator_delegators.insert(validator, &delegators);
+                self.delegator_validator.insert(caller, &validator);
+
+                // Update validator totals
+                let mut info = self.validators.get(validator).unwrap();
+                info.total_delegated = info.total_delegated.saturating_add(amount);
+                self.validators.insert(validator, &info);
+                self.total_delegated_stake =
+                    self.total_delegated_stake.saturating_add(amount);
+
+                self.env().emit_event(StakeDelegated {
+                    delegator: caller,
+                    validator,
+                    amount,
+                });
+                Ok(())
+            })
+        }
+
+        /// Initiate unbonding for the caller's delegation.
+        #[ink(message)]
+        pub fn undelegate(&mut self, validator: AccountId) -> Result<(), Error> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                let mut record = self
+                    .delegations
+                    .get((caller, validator))
+                    .ok_or(Error::DelegationNotFound)?;
+
+                if record.unbonding_start.is_some() {
+                    return Err(Error::AlreadyUnbonding);
+                }
+
+                self.update_validator_rewards(validator);
+                let mut info = self.validators.get(validator).unwrap();
+
+                let now = self.env().block_number() as u64;
+                record.unbonding_start = Some(now);
+                self.delegations.insert((caller, validator), &record);
+
+                info.total_delegated = info.total_delegated.saturating_sub(record.amount);
+                self.validators.insert(validator, &info);
+                self.total_delegated_stake = self
+                    .total_delegated_stake
+                    .saturating_sub(record.amount);
+
+                self.env().emit_event(UndelegationInitiated {
+                    delegator: caller,
+                    validator,
+                    amount: record.amount,
+                    claimable_at: now.saturating_add(UNBONDING_PERIOD_BLOCKS),
+                });
+                Ok(())
+            })
+        }
+
+        /// Claim tokens after the unbonding period has elapsed.
+        #[ink(message)]
+        pub fn claim_undelegated(&mut self, validator: AccountId) -> Result<u128, Error> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                let record = self
+                    .delegations
+                    .get((caller, validator))
+                    .ok_or(Error::DelegationNotFound)?;
+
+                let start = record.unbonding_start.ok_or(Error::DelegationNotFound)?;
+                let now = self.env().block_number() as u64;
+                if now < start.saturating_add(UNBONDING_PERIOD_BLOCKS) {
+                    return Err(Error::UnbondingPeriodActive);
+                }
+
+                let amount = record.amount;
+                self.delegations.remove((caller, validator));
+                self.delegator_validator.remove(caller);
+
+                // Remove from validator_delegators list
+                let mut delegators = self
+                    .validator_delegators
+                    .get(validator)
+                    .unwrap_or_default();
+                if let Some(pos) = delegators.iter().position(|d| *d == caller) {
+                    delegators.swap_remove(pos);
+                }
+                self.validator_delegators.insert(validator, &delegators);
+
+                self.env().emit_event(UndelegatedTokensClaimed {
+                    delegator: caller,
+                    amount,
+                });
+                Ok(amount)
+            })
+        }
+
+        /// Claim pending delegation rewards (net of validator commission).
+        #[ink(message)]
+        pub fn claim_delegation_rewards(
+            &mut self,
+            validator: AccountId,
+        ) -> Result<u128, Error> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                let record = self
+                    .delegations
+                    .get((caller, validator))
+                    .ok_or(Error::DelegationNotFound)?;
+
+                self.update_validator_rewards(validator);
+                let info = self.validators.get(validator).unwrap();
+
+                let reward = self.pending_delegation_reward(&record, &info);
+                if reward == 0 {
+                    return Err(Error::NoRewards);
+                }
+                if reward > self.reward_pool {
+                    return Err(Error::InsufficientPool);
+                }
+
+                self.reward_pool = self.reward_pool.saturating_sub(reward);
+
+                let mut record = self.delegations.get((caller, validator)).unwrap();
+                record.reward_debt = info
+                    .acc_reward_per_share
+                    .saturating_mul(record.amount)
+                    / REWARD_PRECISION;
+                self.delegations.insert((caller, validator), &record);
+
+                self.env().emit_event(DelegationRewardsClaimed {
+                    delegator: caller,
+                    validator,
+                    amount: reward,
+                });
+                Ok(reward)
+            })
+        }
+
+        /// Validator claims their accumulated commission.
+        #[ink(message)]
+        pub fn claim_validator_commission(&mut self) -> Result<u128, Error> {
+            propchain_traits::non_reentrant!(self, {
+                let caller = self.env().caller();
+                if !self.validators.contains(caller) {
+                    return Err(Error::Unauthorized);
+                }
+
+                self.update_validator_rewards(caller);
+                let mut info = self.validators.get(caller).unwrap();
+
+                if info.accumulated_commission == 0 {
+                    return Err(Error::NoRewards);
+                }
+                if info.accumulated_commission > self.reward_pool {
+                    return Err(Error::InsufficientPool);
+                }
+
+                let commission = info.accumulated_commission;
+                self.reward_pool = self.reward_pool.saturating_sub(commission);
+                info.accumulated_commission = 0;
+                self.validators.insert(caller, &info);
+
+                self.env().emit_event(ValidatorCommissionClaimed {
+                    validator: caller,
+                    amount: commission,
+                });
+                Ok(commission)
+            })
+        }
+
+        // =========================================================================
+        // Delegated Staking — Queries
+        // =========================================================================
+
+        /// Returns the DelegationRecord for a (delegator, validator) pair.
+        #[ink(message)]
+        pub fn get_delegation(
+            &self,
+            delegator: AccountId,
+            validator: AccountId,
+        ) -> Option<DelegationRecord> {
+            self.delegations.get((delegator, validator))
+        }
+
+        /// Returns the ValidatorInfo for a validator account.
+        #[ink(message)]
+        pub fn get_validator_info(&self, validator: AccountId) -> Option<ValidatorInfo> {
+            self.validators.get(validator)
+        }
+
+        /// Returns the pending (unclaimed) delegation reward for a delegator.
+        #[ink(message)]
+        pub fn get_pending_delegation_rewards(
+            &self,
+            delegator: AccountId,
+            validator: AccountId,
+        ) -> u128 {
+            let record = match self.delegations.get((delegator, validator)) {
+                Some(r) => r,
+                None => return 0,
+            };
+            let info = match self.validators.get(validator) {
+                Some(i) => i,
+                None => return 0,
+            };
+            self.pending_delegation_reward(&record, &info)
+        }
+
+        /// Returns the list of all registered validator accounts.
+        #[ink(message)]
+        pub fn get_validator_list(&self) -> Vec<AccountId> {
+            self.validator_list.clone()
+        }
+
+        /// Returns the total delegated stake across all validators.
+        #[ink(message)]
+        pub fn get_total_delegated_stake(&self) -> u128 {
+            self.total_delegated_stake
         }
     }
 

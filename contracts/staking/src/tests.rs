@@ -2,6 +2,619 @@
 
 #[cfg(test)]
 mod tests {
+    // =========================================================================
+    // Delegated Staking Tests
+    // =========================================================================
+
+    use super::*;
+
+    fn default_accounts() -> ink::env::test::DefaultAccounts<ink::env::DefaultEnvironment> {
+        ink::env::test::default_accounts::<ink::env::DefaultEnvironment>()
+    }
+
+    fn set_caller(caller: AccountId) {
+        ink::env::test::set_caller::<ink::env::DefaultEnvironment>(caller);
+    }
+
+    fn advance_block(n: u32) {
+        for _ in 0..n {
+            ink::env::test::advance_block::<ink::env::DefaultEnvironment>();
+        }
+    }
+
+    fn create_staking() -> Staking {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        Staking::new(500, 1_000)
+    }
+
+    // ---- Validator Registration ----
+
+    #[ink::test]
+    fn register_validator_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert!(staking.register_validator(MIN_VALIDATOR_STAKE, 500).is_ok());
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert_eq!(info.self_stake, MIN_VALIDATOR_STAKE);
+        assert_eq!(info.commission_rate, 500);
+        assert_eq!(info.total_delegated, 0);
+        assert_eq!(info.accumulated_commission, 0);
+        assert!(info.is_active);
+    }
+
+    #[ink::test]
+    fn register_validator_below_min_stake_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.register_validator(MIN_VALIDATOR_STAKE - 1, 500),
+            Err(Error::InsufficientValidatorStake)
+        );
+    }
+
+    #[ink::test]
+    fn register_validator_invalid_commission_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.register_validator(MIN_VALIDATOR_STAKE, MAX_COMMISSION_RATE + 1),
+            Err(Error::InvalidCommissionRate)
+        );
+    }
+
+    #[ink::test]
+    fn register_validator_max_commission_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert!(staking.register_validator(MIN_VALIDATOR_STAKE, MAX_COMMISSION_RATE).is_ok());
+    }
+
+    #[ink::test]
+    fn register_validator_double_registration_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        assert_eq!(
+            staking.register_validator(MIN_VALIDATOR_STAKE, 500),
+            Err(Error::AlreadyValidator)
+        );
+    }
+
+    #[ink::test]
+    fn get_validator_list_returns_registered() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        let list = staking.get_validator_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], accounts.bob);
+    }
+
+    // ---- Commission Rate Update ----
+
+    #[ink::test]
+    fn update_commission_rate_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        staking.update_commission_rate(1_000).unwrap();
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert_eq!(info.commission_rate, 1_000);
+    }
+
+    #[ink::test]
+    fn update_commission_rate_non_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.update_commission_rate(500),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn update_commission_rate_exceeds_max_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        assert_eq!(
+            staking.update_commission_rate(MAX_COMMISSION_RATE + 1),
+            Err(Error::InvalidCommissionRate)
+        );
+    }
+
+    // ---- Deactivation / Reactivation ----
+
+    #[ink::test]
+    fn deactivate_validator_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        staking.deactivate_validator().unwrap();
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert!(!info.is_active);
+    }
+
+    #[ink::test]
+    fn deactivate_non_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(staking.deactivate_validator(), Err(Error::Unauthorized));
+    }
+
+    #[ink::test]
+    fn reactivate_validator_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        staking.deactivate_validator().unwrap();
+        staking.reactivate_validator().unwrap();
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert!(info.is_active);
+    }
+
+    #[ink::test]
+    fn reactivate_non_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(staking.reactivate_validator(), Err(Error::Unauthorized));
+    }
+
+    // ---- Delegate ----
+
+    #[ink::test]
+    fn delegate_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+
+        let record = staking.get_delegation(accounts.charlie, accounts.bob).unwrap();
+        assert_eq!(record.amount, 5_000);
+        assert!(record.unbonding_start.is_none());
+
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert_eq!(info.total_delegated, 5_000);
+        assert_eq!(staking.get_total_delegated_stake(), 5_000);
+    }
+
+    #[ink::test]
+    fn delegate_to_inactive_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        staking.deactivate_validator().unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.delegate(accounts.bob, 5_000),
+            Err(Error::ValidatorNotActive)
+        );
+    }
+
+    #[ink::test]
+    fn delegate_to_unregistered_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.delegate(accounts.bob, 5_000),
+            Err(Error::ValidatorNotActive)
+        );
+    }
+
+    #[ink::test]
+    fn delegate_below_min_stake_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.delegate(accounts.bob, 500), // below min_stake of 1_000
+            Err(Error::InsufficientAmount)
+        );
+    }
+
+    #[ink::test]
+    fn delegate_double_delegation_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+        assert_eq!(
+            staking.delegate(accounts.bob, 5_000),
+            Err(Error::AlreadyDelegated)
+        );
+    }
+
+    // ---- Undelegate ----
+
+    #[ink::test]
+    fn undelegate_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+        staking.undelegate(accounts.bob).unwrap();
+
+        let record = staking.get_delegation(accounts.charlie, accounts.bob).unwrap();
+        assert!(record.unbonding_start.is_some());
+
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        assert_eq!(info.total_delegated, 0);
+        assert_eq!(staking.get_total_delegated_stake(), 0);
+    }
+
+    #[ink::test]
+    fn undelegate_no_delegation_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.undelegate(accounts.bob),
+            Err(Error::DelegationNotFound)
+        );
+    }
+
+    #[ink::test]
+    fn undelegate_already_unbonding_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+        staking.undelegate(accounts.bob).unwrap();
+        assert_eq!(
+            staking.undelegate(accounts.bob),
+            Err(Error::AlreadyUnbonding)
+        );
+    }
+
+    // ---- Claim Undelegated ----
+
+    #[ink::test]
+    fn claim_undelegated_before_period_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+        staking.undelegate(accounts.bob).unwrap();
+        assert_eq!(
+            staking.claim_undelegated(accounts.bob),
+            Err(Error::UnbondingPeriodActive)
+        );
+    }
+
+    #[ink::test]
+    fn claim_undelegated_after_period_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+        staking.undelegate(accounts.bob).unwrap();
+
+        advance_block(UNBONDING_PERIOD_BLOCKS as u32 + 1);
+
+        let amount = staking.claim_undelegated(accounts.bob).unwrap();
+        assert_eq!(amount, 5_000);
+        assert!(staking.get_delegation(accounts.charlie, accounts.bob).is_none());
+    }
+
+    // ---- Claim Delegation Rewards ----
+
+    #[ink::test]
+    fn claim_delegation_rewards_no_delegation_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.claim_delegation_rewards(accounts.bob),
+            Err(Error::DelegationNotFound)
+        );
+    }
+
+    #[ink::test]
+    fn claim_delegation_rewards_empty_pool_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 1_000_000_000_000_000).unwrap();
+
+        advance_block(100_000);
+
+        // reward_pool is 0 — should fail with InsufficientPool (or NoRewards if 0)
+        let result = staking.claim_delegation_rewards(accounts.bob);
+        assert!(
+            result == Err(Error::NoRewards) || result == Err(Error::InsufficientPool),
+            "expected NoRewards or InsufficientPool, got {:?}",
+            result
+        );
+    }
+
+    #[ink::test]
+    fn claim_delegation_rewards_with_pool_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 0).unwrap(); // 0% commission
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 1_000_000_000_000_000).unwrap();
+
+        advance_block(100_000);
+
+        let pending = staking.get_pending_delegation_rewards(accounts.charlie, accounts.bob);
+        assert!(pending > 0, "expected pending rewards > 0, got {}", pending);
+
+        let claimed = staking.claim_delegation_rewards(accounts.bob).unwrap();
+        assert!(claimed > 0);
+
+        // After claiming, pending should be ~0
+        let pending_after = staking.get_pending_delegation_rewards(accounts.charlie, accounts.bob);
+        assert_eq!(pending_after, 0);
+    }
+
+    // ---- Claim Validator Commission ----
+
+    #[ink::test]
+    fn claim_validator_commission_no_commission_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+        assert_eq!(
+            staking.claim_validator_commission(),
+            Err(Error::NoRewards)
+        );
+    }
+
+    #[ink::test]
+    fn claim_validator_commission_non_validator_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.claim_validator_commission(),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn claim_validator_commission_with_pool_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 1_000).unwrap(); // 10% commission
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 1_000_000_000_000_000).unwrap();
+
+        advance_block(100_000);
+
+        // Trigger accumulator update by calling claim_delegation_rewards
+        // (or directly call claim_validator_commission which calls update internally)
+        set_caller(accounts.bob);
+        let commission = staking.claim_validator_commission().unwrap();
+        assert!(commission > 0, "expected commission > 0, got {}", commission);
+    }
+
+    // ---- Slash Validator ----
+
+    #[ink::test]
+    fn slash_validator_non_admin_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.slash_validator(accounts.bob),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn slash_validator_not_found_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        assert_eq!(
+            staking.slash_validator(accounts.bob),
+            Err(Error::ValidatorNotFound)
+        );
+    }
+
+    #[ink::test]
+    fn slash_validator_reduces_self_stake() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.alice);
+        staking.slash_validator(accounts.bob).unwrap();
+
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        let expected = MIN_VALIDATOR_STAKE * (100 - SLASH_PERCENT) / 100;
+        assert_eq!(info.self_stake, expected);
+    }
+
+    #[ink::test]
+    fn slash_validator_reduces_delegator_amounts() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE * 10, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+
+        set_caller(accounts.alice);
+        staking.slash_validator(accounts.bob).unwrap();
+
+        let record = staking.get_delegation(accounts.charlie, accounts.bob).unwrap();
+        let expected = 5_000u128 * (100 - SLASH_PERCENT) / 100;
+        assert_eq!(record.amount, expected);
+    }
+
+    #[ink::test]
+    fn slash_validator_below_min_deactivates() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        // Register with exactly MIN_VALIDATOR_STAKE so slash drops below minimum
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.alice);
+        staking.slash_validator(accounts.bob).unwrap();
+
+        let info = staking.get_validator_info(accounts.bob).unwrap();
+        // After 20% slash: 10_000_000 * 0.8 = 8_000_000 < MIN_VALIDATOR_STAKE
+        assert!(!info.is_active);
+
+        // New delegations should be rejected
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.delegate(accounts.bob, 5_000),
+            Err(Error::ValidatorNotActive)
+        );
+    }
+
+    // ---- End-to-End Flow ----
+
+    #[ink::test]
+    fn full_delegation_lifecycle() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        // Fund pool
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000_000_000).unwrap();
+
+        // Register validator with 0% commission
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 0).unwrap();
+
+        // Delegate
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 1_000_000_000_000_000).unwrap();
+
+        // Advance blocks to accrue rewards
+        advance_block(100_000);
+
+        // Claim rewards
+        let reward = staking.claim_delegation_rewards(accounts.bob).unwrap();
+        assert!(reward > 0);
+
+        // Undelegate
+        staking.undelegate(accounts.bob).unwrap();
+
+        // Advance past unbonding period
+        advance_block(UNBONDING_PERIOD_BLOCKS as u32 + 1);
+
+        // Claim undelegated
+        let amount = staking.claim_undelegated(accounts.bob).unwrap();
+        assert_eq!(amount, 1_000_000_000_000_000);
+        assert!(staking.get_delegation(accounts.charlie, accounts.bob).is_none());
+    }
+
+    #[ink::test]
+    fn slash_multiple_delegators() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE * 10, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 10_000).unwrap();
+
+        set_caller(accounts.django);
+        staking.delegate(accounts.bob, 20_000).unwrap();
+
+        set_caller(accounts.alice);
+        staking.slash_validator(accounts.bob).unwrap();
+
+        let r1 = staking.get_delegation(accounts.charlie, accounts.bob).unwrap();
+        let r2 = staking.get_delegation(accounts.django, accounts.bob).unwrap();
+        assert_eq!(r1.amount, 10_000u128 * (100 - SLASH_PERCENT) / 100);
+        assert_eq!(r2.amount, 20_000u128 * (100 - SLASH_PERCENT) / 100);
+    }
+
+    #[ink::test]
+    fn total_delegated_stake_consistency() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.register_validator(MIN_VALIDATOR_STAKE, 500).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.delegate(accounts.bob, 5_000).unwrap();
+
+        assert_eq!(staking.get_total_delegated_stake(), 5_000);
+
+        let list = staking.get_validator_list();
+        let sum: u128 = list
+            .iter()
+            .filter_map(|v| staking.get_validator_info(*v))
+            .map(|i| i.total_delegated)
+            .sum();
+        assert_eq!(sum, staking.get_total_delegated_stake());
+    }
+}
     use super::*;
 
     fn default_accounts() -> ink::env::test::DefaultAccounts<ink::env::DefaultEnvironment> {

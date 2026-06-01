@@ -160,3 +160,89 @@ pub struct ParamProposal {
     pub status: ProposalStatus,
     pub created_at: u64,
 }
+
+// ─── Delegated Staking Types ────────────────────────────────────────────────
+
+/// Maximum commission rate a validator may set (100% in basis points).
+pub const MAX_COMMISSION_RATE: u32 = 10_000;
+
+/// Minimum self-stake required for a validator to register or remain active.
+pub const MIN_VALIDATOR_STAKE: u128 = 10_000_000;
+
+/// Percentage of stake slashed on a misbehaving validator (and their delegators).
+pub const SLASH_PERCENT: u128 = 20;
+
+/// Unbonding period in blocks (~3.5 days at 6-second blocks).
+pub const UNBONDING_PERIOD_BLOCKS: u64 = 50_400;
+
+/// Scaling factor used in the per-validator reward accumulator (10^12).
+pub const REWARD_PRECISION: u128 = 1_000_000_000_000;
+
+/// On-chain record for a registered validator.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ValidatorInfo {
+    /// The validator's own self-stake (subject to slashing).
+    pub self_stake: u128,
+    /// Commission rate in basis points (0–10_000).
+    pub commission_rate: u32,
+    /// Sum of all active delegated amounts to this validator.
+    pub total_delegated: u128,
+    /// Accumulated commission not yet claimed.
+    pub accumulated_commission: u128,
+    /// Whether the validator is currently accepting delegations.
+    pub is_active: bool,
+    /// Cumulative reward-per-share for delegators (scaled by REWARD_PRECISION).
+    pub acc_reward_per_share: u128,
+    /// Block number of the last reward accumulation update.
+    pub last_reward_block: u64,
+}
+
+/// On-chain record for a single delegator → validator binding.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct DelegationRecord {
+    /// The delegator account that owns this record.
+    pub delegator: AccountId,
+    /// The validator this delegation is bound to.
+    pub validator: AccountId,
+    /// The delegated token amount (reduced by slashing).
+    pub amount: u128,
+    /// Snapshot of validator's acc_reward_per_share at last claim/delegation.
+    pub reward_debt: u128,
+    /// None = active; Some(block) = unbonding started at that block.
+    pub unbonding_start: Option<u64>,
+}
+
+/// Reason a validator was deactivated (used in ValidatorDeactivated event).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum DeactivationReason {
+    Voluntary,
+    Slashed,
+}
