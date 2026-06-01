@@ -1402,6 +1402,38 @@ mod propchain_escrow {
             Ok(conditions.iter().all(|c| c.met))
         }
 
+        /// Returns the multi-sig status summary for an escrow:
+        /// (required_signatures, current_signatures_for_release, current_signatures_for_refund, signers)
+        #[ink(message)]
+        pub fn get_multi_sig_status(&self, escrow_id: u64) -> Result<(u8, u8, u8, Vec<AccountId>), Error> {
+            let config = self
+                .multi_sig_configs
+                .get(&escrow_id)
+                .ok_or(Error::EscrowNotFound)?;
+            let release_count = self
+                .signature_counts
+                .get(&(escrow_id, ApprovalType::Release))
+                .unwrap_or(0);
+            let refund_count = self
+                .signature_counts
+                .get(&(escrow_id, ApprovalType::Refund))
+                .unwrap_or(0);
+            Ok((
+                config.required_signatures,
+                release_count,
+                refund_count,
+                config.signers.clone(),
+            ))
+        }
+
+        /// Returns whether a specific participant has signed for a given approval type.
+        #[ink(message)]
+        pub fn has_signed(&self, escrow_id: u64, approval_type: ApprovalType, signer: AccountId) -> bool {
+            self.signatures
+                .get(&(escrow_id, approval_type, signer))
+                .unwrap_or(false)
+        }
+
         /// Set admin (deprecated — prefer request_admin_rotation + confirm_admin_rotation)
         #[ink(message)]
         pub fn set_admin(&mut self, new_admin: AccountId) -> Result<(), Error> {
