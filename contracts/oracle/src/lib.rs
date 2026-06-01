@@ -77,6 +77,12 @@ mod propchain_oracle {
         /// Maximum batch size for batch operations
         max_batch_size: u32,
 
+        // ── Update Frequency Control (Issue #225) ────────────────────────────
+        /// Minimum interval (in blocks) between two updates for the same source
+        min_update_interval_blocks: u64,
+        /// Last update time per source: source_id -> block_number
+        last_source_update: Mapping<String, u64>,
+
         // ── Circuit Breaker (Issue #316) ──────────────────────────────────────
         /// When true, valuation updates that exceed `volatility_threshold` are
         /// automatically blocked until an admin resets the breaker.
@@ -269,6 +275,8 @@ mod propchain_oracle {
                 request_id_counter: 0,
                 ai_valuation_contract: None,
                 max_batch_size: 50,
+                min_update_interval_blocks: 6, // ~36 seconds at 6s blocks
+                last_source_update: Mapping::default(),
                 // Circuit breaker defaults (Issue #316)
                 circuit_breaker_active: false,
                 volatility_threshold: 20, // 20% default threshold
@@ -1190,338 +1198,25 @@ mod propchain_oracle {
             self.ai_valuation_contract
         }
 
-        // ── Data Verification API (Issue #221) ────────────────────────────────
+        // ── Aggregation API (Issue #224) ─────────────────────────────────────
 
-        /// Request data verification for an oracle source.
+        /// Returns the current aggregation method.
         #[ink(message)]
-        pub fn request_data_verification(
-            &mut self,
-            source_id: String,
-            property_id: u64,
-            reported_price: u128,
-        ) -> Result<u64, OracleError> {
-            let caller = self.env().caller();
-
-            // Verify the source exists
-            if self.oracle_sources.get(&source_id).is_none() {
-                return Err(OracleError::OracleSourceNotFound);
-            }
-
-            let request_id = self.verification_counter;
-            self.verification_counter = self.verification_counter.saturating_add(1);
-
-            let deadline = self
-                .env()
-                .block_timestamp()
-                .saturating_add(3600_000); // 1 hour window
-
-            let request = DataVerificationRequest {
-                request_id,
-                source_id: source_id.clone(),
-                property_id,
-                reported_price,
-                submitter: caller,
-                status: VerificationStatus::Pending,
-                created_at: self.env().block_timestamp(),
-                deadline,
-            };
-
-            self.verification_requests.insert(&request_id, &request);
-
-            self.env().emit_event(VerificationRequested {
-                request_id,
-                source_id,
-                property_id,
-                reported_price,
-                submitter: caller,
-                deadline,
-            });
-
-            Ok(request_id)
+        pub fn get_aggregation_method(&self) -> AggregationMethod {
+            self.aggregation_method.clone()
         }
 
-        /// Submit a verification proof for a data verification request.
+        /// Admin: set the aggregation method.
         #[ink(message)]
-        pub fn submit_verification_proof(
-            &mut self,
-            request_id: u64,
-            proof_type: String,
-            proof_data: Vec<u8>,
-            metadata: String,
-        ) -> Result<(), OracleError> {
-            let caller = self.env().caller();
-
-            let mut request = self
-                .verification_requests
-                .get(&request_id)
-                .ok_or(OracleError::PropertyNotFound)?;
-
-            // Ensure request is still pending/in progress
-            if request.status == VerificationStatus::Verified
-                || request.status == VerificationStatus::Failed
-                || request.status == VerificationStatus::Expired
-            {
-                return Err(OracleError::AlreadyExists);
-            }
-
-            // Update request status to in progress
-            if request.status == VerificationStatus::Pending {
-                request.status = VerificationStatus::InProgress;
-                self.verification_requests.insert(&request_id, &request);
-            }
-
-            let proof = VerificationProof {
-                request_id,
-                verifier: caller,
-                proof_type: proof_type.clone(),
-                proof_data,
-                metadata,
-                submitted_at: self.env().block_timestamp(),
-            };
-
-            let mut proofs = self.verification_proofs.get(&request_id).unwrap_or_default();
-            proofs.push(proof);
-            self.verification_proofs.insert(&request_id, &proofs);
-
-            self.env().emit_event(VerificationProofSubmitted {
-                request_id,
-                verifier: caller,
-                proof_type,
-            });
-
-            Ok(())
-        }
-
-        /// Complete a verification by resolving its status.
-        /// Only the original submitter or admin can finalise.
-        #[ink(message)]
-        pub fn resolve_verification(
-            &mut self,
-            request_id: u64,
-            status: VerificationStatus,
-        ) -> Result<(), OracleError> {
-            let caller = self.env().caller();
-
-            let mut request = self
-                .verification_requests
-                .get(&request_id)
-                .ok_or(OracleError::PropertyNotFound)?;
-
-            // Only submitter or admin can resolve
-            if caller != request.submitter {
-                self.ensure_admin()?;
-            }
-
-            request.status = status;
-            self.verification_requests.insert(&request_id, &request);
-
-            let proof_count = self
-                .verification_proofs
-                .get(&request_id)
-                .map(|p| p.len() as u32)
-                .unwrap_or(0);
-
-            self.env().emit_event(VerificationCompleted {
-                request_id,
-                status,
-                proof_count,
-            });
-
-            Ok(())
-        }
-
-        /// Get a verification request by ID.
-        #[ink(message)]
-        pub fn get_verification_request(
-            &self,
-            request_id: u64,
-        ) -> Option<DataVerificationRequest> {
-            self.verification_requests.get(&request_id)
-        }
-
-        /// Get all verification proofs for a request.
-        #[ink(message)]
-        pub fn get_verification_proofs(
-            &self,
-            request_id: u64,
-        ) -> Vec<VerificationProof> {
-            self.verification_proofs.get(&request_id).unwrap_or_default()
-        }
-
-        // ── Fallback Mechanism API (Issue #220) ───────────────────────────────
-
-        /// Update the fallback configuration (admin only).
-        #[ink(message)]
-        pub fn set_fallback_config(&mut self, config: FallbackConfig) -> Result<(), OracleError> {
+        pub fn set_aggregation_method(&mut self, method: AggregationMethod) -> Result<(), OracleError> {
             self.ensure_admin()?;
-            self.fallback_config = config;
-            self.env().emit_event(FallbackConfigUpdated {
-                enabled: self.fallback_config.enabled,
-                fallback_delay_blocks: self.fallback_config.fallback_delay_blocks,
-                max_fallback_attempts: self.fallback_config.max_fallback_attempts,
+            let old = self.aggregation_method.clone();
+            self.aggregation_method = method;
+            self.env().emit_event(AggregationMethodUpdated {
+                old_method: old,
+                new_method: self.aggregation_method.clone(),
             });
             Ok(())
-        }
-
-        /// Get the current fallback configuration.
-        #[ink(message)]
-        pub fn get_fallback_config(&self) -> FallbackConfig {
-            self.fallback_config.clone()
-        }
-
-        /// Add a fallback oracle source (admin only).
-        #[ink(message)]
-        pub fn add_fallback_source(&mut self, source: FallbackSource) -> Result<(), OracleError> {
-            self.ensure_admin()?;
-
-            if self.fallback_sources.get(&source.id).is_some() {
-                return Err(OracleError::AlreadyExists);
-            }
-
-            self.fallback_sources.insert(&source.id, &source);
-
-            // Maintain sorted order by priority
-            if !self.fallback_source_ids.contains(&source.id) {
-                self.fallback_source_ids.push(source.id.clone());
-                self.fallback_source_ids
-                    .sort_by(|a, b| {
-                        let pa = self
-                            .fallback_sources
-                            .get(a)
-                            .map(|s| s.priority)
-                            .unwrap_or(999);
-                        let pb = self
-                            .fallback_sources
-                            .get(b)
-                            .map(|s| s.priority)
-                            .unwrap_or(999);
-                        pa.cmp(&pb)
-                    });
-            }
-
-            self.env().emit_event(FallbackSourceAdded {
-                source_id: source.id,
-                priority: source.priority,
-            });
-
-            Ok(())
-        }
-
-        /// Remove a fallback source (admin only).
-        #[ink(message)]
-        pub fn remove_fallback_source(&mut self, source_id: String) -> Result<(), OracleError> {
-            self.ensure_admin()?;
-
-            if self.fallback_sources.get(&source_id).is_none() {
-                return Err(OracleError::OracleSourceNotFound);
-            }
-
-            self.fallback_sources.remove(&source_id);
-            self.fallback_source_ids.retain(|id| id != &source_id);
-
-            self.env().emit_event(FallbackSourceRemoved { source_id });
-
-            Ok(())
-        }
-
-        /// Query the oracle with automatic fallback support.
-        /// If the primary source fails, fallback sources are tried in priority order.
-        #[ink(message)]
-        pub fn query_with_fallback(
-            &mut self,
-            property_id: u64,
-        ) -> Result<FallbackQueryResult, OracleError> {
-            let mut attempts = 0u32;
-            let max_attempts = self.fallback_config.max_fallback_attempts;
-
-            // First try primary sources
-            match self.collect_prices_from_sources(property_id) {
-                Ok(prices) if !prices.is_empty() => {
-                    let price = self.aggregate_prices(&prices)?;
-                    return Ok(FallbackQueryResult {
-                        success: true,
-                        price,
-                        source_id: "primary".to_string(),
-                        attempts: 0,
-                        timestamp: self.env().block_timestamp(),
-                        error: String::new(),
-                    });
-                }
-                _ => {} // Fall through to fallback
-            }
-
-            // Try fallback sources in priority order
-            for source_id in &self.fallback_source_ids {
-                if attempts >= max_attempts {
-                    break;
-                }
-
-                if let Some(source) = self.fallback_sources.get(source_id) {
-                    if !source.active {
-                        continue;
-                    }
-
-                    attempts += 1;
-
-                    // In production, this would call the external fallback source
-                    // For now, try manual price lookup as the fallback mechanism
-                    match self.get_latest_manual_price(property_id) {
-                        Ok(price_data) => {
-                            // Update success count
-                            let mut updated = source.clone();
-                            updated.success_count = source.success_count.saturating_add(1);
-                            self.fallback_sources.insert(source_id, &updated);
-
-                            self.env().emit_event(FallbackTriggered {
-                                primary_source_id: "primary".to_string(),
-                                fallback_source_id: source_id.clone(),
-                                property_id,
-                                attempts,
-                            });
-
-                            return Ok(FallbackQueryResult {
-                                success: true,
-                                price: price_data.price,
-                                source_id: source_id.clone(),
-                                attempts,
-                                timestamp: self.env().block_timestamp(),
-                                error: String::new(),
-                            });
-                        }
-                        Err(_) => {
-                            // Update failure count
-                            let mut updated = source.clone();
-                            updated.failure_count = source.failure_count.saturating_add(1);
-                            self.fallback_sources.insert(source_id, &updated);
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            Ok(FallbackQueryResult {
-                success: false,
-                price: 0,
-                source_id: String::new(),
-                attempts,
-                timestamp: self.env().block_timestamp(),
-                error: "All fallback sources exhausted".to_string(),
-            })
-        }
-
-        /// Get all registered fallback sources.
-        #[ink(message)]
-        pub fn get_fallback_sources(&self) -> Vec<FallbackSource> {
-            self.fallback_source_ids
-                .iter()
-                .filter_map(|id| self.fallback_sources.get(id))
-                .collect()
-        }
-
-        /// Get a specific fallback source by ID.
-        #[ink(message)]
-        pub fn get_fallback_source(&self, source_id: String) -> Option<FallbackSource> {
-            self.fallback_sources.get(&source_id)
         }
 
         /// Add oracle source (admin only)
@@ -1602,20 +1297,45 @@ mod propchain_oracle {
             Ok(())
         }
 
+        fn enforce_frequency_check(&self, source_id: &str) -> Result<(), OracleError> {
+            if self.min_update_interval_blocks == 0 {
+                return Ok(()); // No frequency limit
+            }
+            let last = self.last_source_update.get(&source_id.to_string()).unwrap_or(0);
+            let current = self.env().block_number() as u64;
+            if last > 0 && current.saturating_sub(last) < self.min_update_interval_blocks {
+                return Err(OracleError::RequestPending);
+            }
+            Ok(())
+        }
+
         fn collect_prices_from_sources(
-            &self,
+            &mut self,
             property_id: u64,
         ) -> Result<Vec<PriceData>, OracleError> {
             let mut prices = Vec::new();
+            let current_block = self.env().block_number() as u64;
 
             for source_id in &self.active_sources {
                 if let Some(source) = self.oracle_sources.get(source_id) {
+                    // Frequency control check
+                    if let Err(e) = self.enforce_frequency_check(source_id) {
+                        self.env().emit_event(UpdateThrottled {
+                            source_id: source_id.clone(),
+                            last_update: self.last_source_update.get(source_id).unwrap_or(0),
+                            current_block,
+                            min_interval: self.min_update_interval_blocks,
+                        });
+                        continue;
+                    }
+
                     // In a real implementation, this would call external price feeds
-                    // For now, we'll simulate price collection
                     match self.get_price_from_source(&source, property_id) {
                         Ok(price_data) => {
                             if self.is_price_fresh(&price_data) {
                                 prices.push(price_data);
+                                // Update last-update timestamp
+                                self.last_source_update.insert(source_id, &current_block);
                             }
                         }
                         Err(_) => continue, // Skip failed sources
@@ -1736,27 +1456,48 @@ mod propchain_oracle {
             }
 
             // Remove outliers
-            let filtered_prices = self.filter_outliers(prices);
+            let filtered = self.filter_outliers(prices);
 
-            if filtered_prices.is_empty() {
+            if filtered.is_empty() {
                 return Err(OracleError::InsufficientSources);
             }
 
-            // Weighted average based on source weights
-            let mut total_weighted_price = 0u128;
-            let mut total_weight = 0u32;
-
-            for price_data in &filtered_prices {
-                let weight = self.get_source_weight(&price_data.source)?;
-                total_weighted_price += price_data.price * weight as u128;
-                total_weight += weight;
+            match self.aggregation_method {
+                AggregationMethod::WeightedMean => {
+                    let mut total_weighted = 0u128;
+                    let mut total_weight = 0u32;
+                    for p in &filtered {
+                        let w = self.get_source_weight(&p.source)?;
+                        total_weighted += p.price * w as u128;
+                        total_weight += w;
+                    }
+                    if total_weight == 0 {
+                        return Err(OracleError::InvalidParameters);
+                    }
+                    Ok(total_weighted / total_weight as u128)
+                }
+                AggregationMethod::Median => {
+                    let mut sorted: Vec<u128> = filtered.iter().map(|p| p.price).collect();
+                    sorted.sort();
+                    let len = sorted.len();
+                    if len % 2 == 0 {
+                        Ok((sorted[len / 2 - 1] + sorted[len / 2]) / 2)
+                    } else {
+                        Ok(sorted[len / 2])
+                    }
+                }
+                AggregationMethod::TrimmedMean(trim_count) => {
+                    let mut sorted: Vec<u128> = filtered.iter().map(|p| p.price).collect();
+                    sorted.sort();
+                    let trim = (trim_count as usize).min(sorted.len() / 3);
+                    let trimmed = &sorted[trim..sorted.len() - trim];
+                    if trimmed.is_empty() {
+                        return Err(OracleError::InsufficientSources);
+                    }
+                    let sum: u128 = trimmed.iter().sum();
+                    Ok(sum / trimmed.len() as u128)
+                }
             }
-
-            if total_weight == 0 {
-                return Err(OracleError::InvalidParameters);
-            }
-
-            Ok(total_weighted_price / total_weight as u128)
         }
 
         pub fn filter_outliers(&self, prices: &[PriceData]) -> Vec<PriceData> {
