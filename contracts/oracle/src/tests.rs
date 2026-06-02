@@ -355,6 +355,93 @@ mod oracle_tests {
     }
 
     #[ink::test]
+    fn test_property_trend_metrics_and_direction() {
+        let mut oracle = setup_oracle();
+        let property_id = 2;
+        let prices = vec![100u128, 120, 140, 160, 180, 200, 220];
+        let base_timestamp = 1_000_000u64;
+
+        assert!(oracle.set_ema_alpha(5000).is_ok());
+
+        for (index, price) in prices.iter().enumerate() {
+            let valuation = PropertyValuation {
+                property_id,
+                valuation: *price,
+                confidence_score: 90,
+                sources_used: 3,
+                last_updated: base_timestamp + index as u64 * 86_400,
+                valuation_method: ValuationMethod::MarketData,
+            };
+
+            assert!(oracle.update_property_valuation(property_id, valuation).is_ok());
+        }
+
+        test::set_block_timestamp::<DefaultEnvironment>(base_timestamp + 8 * 86_400);
+
+        let trend = oracle.get_property_trend(property_id).expect("Trend should exist");
+        assert_eq!(trend.current_price, 220);
+        assert_eq!(trend.sma_7d, 160);
+        assert_eq!(trend.sma_30d, 160);
+        assert_eq!(trend.ema_7d, 200);
+        assert_eq!(trend.trend_direction, TrendDirection::Up);
+    }
+
+    #[ink::test]
+    fn test_property_trend_direction_stable() {
+        let mut oracle = setup_oracle();
+        let property_id = 3;
+        let prices = vec![100u128, 101, 100, 100, 101, 100, 100];
+        let base_timestamp = 2_000_000u64;
+
+        assert!(oracle.set_ema_alpha(3000).is_ok());
+
+        for (index, price) in prices.iter().enumerate() {
+            let valuation = PropertyValuation {
+                property_id,
+                valuation: *price,
+                confidence_score: 90,
+                sources_used: 3,
+                last_updated: base_timestamp + index as u64 * 86_400,
+                valuation_method: ValuationMethod::MarketData,
+            };
+
+            assert!(oracle.update_property_valuation(property_id, valuation).is_ok());
+        }
+
+        test::set_block_timestamp::<DefaultEnvironment>(base_timestamp + 8 * 86_400);
+
+        let trend = oracle.get_property_trend(property_id).expect("Trend should exist");
+        assert_eq!(trend.trend_direction, TrendDirection::Stable);
+    }
+
+    #[ink::test]
+    fn test_volatility_index_window_calculation() {
+        let mut oracle = setup_oracle();
+        let property_id = 4;
+        let prices = vec![100u128, 110, 90, 105];
+        let base_timestamp = 3_000_000u64;
+
+        for (index, price) in prices.iter().enumerate() {
+            let valuation = PropertyValuation {
+                property_id,
+                valuation: *price,
+                confidence_score: 80,
+                sources_used: 3,
+                last_updated: base_timestamp + index as u64 * 86_400,
+                valuation_method: ValuationMethod::MarketData,
+            };
+
+            assert!(oracle.update_property_valuation(property_id, valuation).is_ok());
+        }
+
+        test::set_block_timestamp::<DefaultEnvironment>(base_timestamp + 5 * 86_400);
+        let volatility = oracle
+            .get_volatility_index(property_id, 7)
+            .expect("Volatility index query should succeed");
+        assert!(volatility > 0);
+    }
+
+    #[ink::test]
     fn test_batch_request_works() {
         let mut oracle = setup_oracle();
         let result = oracle.batch_request_valuations(vec![1, 2, 3]).unwrap();

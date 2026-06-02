@@ -48,6 +48,12 @@ mod propchain_oracle {
         /// Market trends data
         pub market_trends: Mapping<String, MarketTrend>,
 
+        /// Per-property trend metrics cache
+        property_trends: Mapping<u64, TrendMetrics>,
+
+        /// Configurable EMA smoothing factor in basis points (0-10000)
+        ema_alpha_bps: u32,
+
         /// Comparable properties cache
         comparable_cache: Mapping<u64, Vec<ComparableProperty>>,
 
@@ -265,6 +271,8 @@ mod propchain_oracle {
                 price_alerts: Mapping::default(),
                 location_adjustments: Mapping::default(),
                 market_trends: Mapping::default(),
+                property_trends: Mapping::default(),
+                ema_alpha_bps: 1000, // Default alpha = 0.10
                 comparable_cache: Mapping::default(),
                 max_price_staleness: propchain_traits::constants::DEFAULT_MAX_PRICE_STALENESS,
                 min_sources_required: propchain_traits::constants::DEFAULT_MIN_SOURCES_REQUIRED,
@@ -379,7 +387,30 @@ mod propchain_oracle {
                 timestamp: self.env().block_timestamp(),
             });
 
+            self.update_trend_metrics(property_id);
+
             Ok(())
+        }
+
+        /// Get the trend metrics for a property.
+        #[ink(message)]
+        pub fn get_property_trend(&self, property_id: u64) -> Result<TrendMetrics, OracleError> {
+            self.property_trends
+                .get(&property_id)
+                .ok_or(OracleError::PropertyNotFound)
+        }
+
+        /// Get volatility index for a property over a given window of days.
+        #[ink(message)]
+        pub fn get_volatility_index(
+            &self,
+            property_id: u64,
+            window_days: u32,
+        ) -> Result<u32, OracleError> {
+            if window_days == 0 {
+                return Err(OracleError::InvalidParameters);
+            }
+            self.calculate_volatility_index(property_id, window_days)
         }
 
         // ── Circuit Breaker public API (Issue #316) ───────────────────────────
@@ -1780,6 +1811,127 @@ mod propchain_oracle {
             Ok((avg_change_bp / 100).min(100) as u32) // Convert to percentage
         }
 
+        fn calculate_volatility_index(
+            &self,
+            property_id: u64,
+            window_days: u32,
+        ) -> Result<u32, OracleError> {
+            let history = self.collect_historical_window(property_id, window_days);
+            if history.len() < 2 {
+                return Ok(0);
+            }
+
+            let mut changes_bp = Vec::new();
+            for i in 1..history.len() {
+                let prev = history[i - 1].valuation;
+                let curr = history[i].valuation;
+                if prev > 0 {
+                    changes_bp.push((curr.abs_diff(prev) * 10000) / prev);
+                }
+            }
+
+            if changes_bp.is_empty() {
+                return Ok(0);
+            }
+
+            let avg_bp: u128 = changes_bp.iter().sum::<u128>() / changes_bp.len() as u128;
+            Ok((avg_bp / 100).min(100) as u32)
+        }
+
+        fn collect_historical_window(&self, property_id: u64, window_days: u32) -> Vec<PropertyValuation> {
+            let history = self
+                .historical_valuations
+                .get(&property_id)
+                .unwrap_or_default();
+
+            if window_days == 0 {
+                return history;
+            }
+
+            let earliest = self
+                .env()
+                .block_timestamp()
+                .saturating_sub(window_days as u64 * 86_400);
+
+            history
+                .into_iter()
+                .filter(|entry| entry.last_updated >= earliest)
+                .collect()
+        }
+
+        fn calculate_ema(&self, history: &[PropertyValuation]) -> u128 {
+            if history.is_empty() {
+                return 0;
+            }
+
+            let alpha_bps = self.ema_alpha_bps.min(10000) as u128;
+            let mut ema = history[0].valuation;
+
+            for entry in history.iter().skip(1) {
+                ema = (entry.valuation.saturating_mul(alpha_bps)
+                    + ema.saturating_mul(10000u128.saturating_sub(alpha_bps)))
+                    / 10000u128;
+            }
+
+            ema
+        }
+
+        fn calculate_sma(&self, history: &[PropertyValuation]) -> u128 {
+            if history.is_empty() {
+                return 0;
+            }
+            let sum: u128 = history.iter().map(|entry| entry.valuation).sum();
+            sum / history.len() as u128
+        }
+
+        fn determine_trend_direction(&self, current_price: u128, ema_7d: u128) -> TrendDirection {
+            if ema_7d == 0 {
+                return TrendDirection::Stable;
+            }
+
+            let difference = if current_price >= ema_7d {
+                current_price - ema_7d
+            } else {
+                ema_7d - current_price
+            };
+            let threshold = (current_price * 100) / 10000; // 1% threshold
+
+            if difference <= threshold {
+                TrendDirection::Stable
+            } else if current_price > ema_7d {
+                TrendDirection::Up
+            } else {
+                TrendDirection::Down
+            }
+        }
+
+        fn update_trend_metrics(&mut self, property_id: u64) {
+            if let Ok(metrics) = self.compute_trend_metrics(property_id) {
+                self.property_trends.insert(&property_id, &metrics);
+            }
+        }
+
+        fn compute_trend_metrics(
+            &self,
+            property_id: u64,
+        ) -> Result<TrendMetrics, OracleError> {
+            let current = self.get_property_valuation(property_id)?;
+            let window_7d = self.collect_historical_window(property_id, 7);
+            let window_30d = self.collect_historical_window(property_id, 30);
+            let ema_7d = self.calculate_ema(&window_7d);
+            let sma_7d = self.calculate_sma(&window_7d);
+            let sma_30d = self.calculate_sma(&window_30d);
+            let trend_direction = self.determine_trend_direction(current.valuation, ema_7d);
+
+            Ok(TrendMetrics {
+                current_price: current.valuation,
+                ema_7d,
+                sma_7d,
+                sma_30d,
+                trend_direction,
+            })
+        }
+
         fn calculate_confidence_interval(
             &self,
             valuation: &PropertyValuation,
@@ -1851,6 +2003,23 @@ mod propchain_oracle {
             let diff = new_value.abs_diff(old_value);
 
             (diff * 100) / old_value
+        }
+
+        /// Get the configured EMA alpha in basis points.
+        #[ink(message)]
+        pub fn get_ema_alpha(&self) -> u32 {
+            self.ema_alpha_bps
+        }
+
+        /// Set the EMA smoothing factor in basis points (0-10000).
+        #[ink(message)]
+        pub fn set_ema_alpha(&mut self, alpha_bps: u32) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            if alpha_bps > 10000 {
+                return Err(OracleError::InvalidParameters);
+            }
+            self.ema_alpha_bps = alpha_bps;
+            Ok(())
         }
 
         /// Clear pending request after successful update

@@ -75,3 +75,23 @@ pub struct GovernanceProposal {
     pub executed: bool,
     pub created_at: u64,
 }
+
+/// Direction of property price trend.
+#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub enum TrendDirection {
+    Up,
+    Down,
+    Stable,
+}
+
+/// Property trend metrics for valuation analysis.
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+pub struct TrendMetrics {
+    pub current_price: u128,
+    pub ema_7d: u128,
+    pub sma_7d: u128,
+    pub sma_30d: u128,
+    pub trend_direction: TrendDirection,
+}
