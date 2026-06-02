@@ -1090,10 +1090,10 @@ pub mod propchain_contracts {
         changed_by: AccountId,
     }
 
-    /// Batch event for multiple property registrations
+    /// Event emitted when a batch of properties is registered atomically
     /// Indexed fields: owner for efficient filtering
     #[ink(event)]
-    pub struct BatchPropertyRegistered {
+    pub struct BatchPropertiesRegistered {
         #[ink(topic)]
         owner: AccountId,
         #[ink(topic)]
@@ -2742,12 +2742,15 @@ pub mod propchain_contracts {
             Ok(())
         }
 
-        /// Batch registers multiple properties in a single transaction
+        /// Atomically batch registers multiple properties in a single transaction.
+        ///
+        /// If any property metadata is invalid or any pre-check fails, the entire
+        /// batch is rejected and no state changes are applied.
         #[ink(message)]
         pub fn batch_register_properties(
             &mut self,
             properties: Vec<PropertyMetadata>,
-        ) -> Result<BatchResult, Error> {
+        ) -> Result<Vec<u64>, Error> {
             self.ensure_not_paused()?;
             if properties.is_empty() {
                 return Err(Error::ValueOutOfBounds);
@@ -2755,35 +2758,23 @@ pub mod propchain_contracts {
             self.validate_batch_size(properties.len())?;
 
             let caller = self.env().caller();
-            let timestamp = self.env().block_timestamp();
-            let total_items = properties.len() as u32;
-            let mut successes = Vec::new();
-            let mut failures = Vec::new();
-            let mut early_terminated = false;
-            let mut next_id = self.property_count + 1;
 
+            // Ensure the caller meets identity and compliance requirements before any state changes.
+            self.check_identity_requirements(caller)?;
+            self.check_compliance(caller)?;
+
+            // Validate all properties before mutating state to ensure atomic behavior.
+            for metadata in &properties {
+                Self::validate_metadata(metadata)?;
+            }
+
+            let timestamp = self.env().block_timestamp();
+            let property_count_start = self.property_count;
+            let mut property_ids = Vec::new();
             let mut owner_props = self.owner_properties.get(caller).unwrap_or_default();
 
-            for (i, metadata) in properties.into_iter().enumerate() {
-                // Check early termination
-                if failures.len() >= self.batch_config.max_failure_threshold as usize {
-                    early_terminated = true;
-                    break;
-                }
-
-                // Validate metadata
-                if let Err(e) = Self::validate_metadata(&metadata) {
-                    failures.push(BatchItemFailure {
-                        index: i as u32,
-                        item_id: 0,
-                        error: e,
-                    });
-                    continue;
-                }
-
-                let property_id = next_id;
-                next_id += 1;
-
+            for metadata in properties {
+                let property_id = property_count_start + property_ids.len() as u64 + 1;
                 let property_info = PropertyInfo {
                     id: property_id,
                     owner: caller,
@@ -2793,49 +2784,45 @@ pub mod propchain_contracts {
 
                 self.properties.insert(property_id, &property_info);
                 owner_props.push(property_id);
-                successes.push(property_id);
+                property_ids.push(property_id);
+
+                self.cached_analytics.total_valuation += property_info.metadata.valuation;
+                self.cached_analytics.total_size += property_info.metadata.size;
             }
 
-            // Update property count only if there were successes
-            if !successes.is_empty() {
-                self.property_count = next_id - 1;
-                self.owner_properties.insert(caller, &owner_props);
+            self.property_count = property_count_start + property_ids.len() as u64;
+            self.owner_properties.insert(caller, &owner_props);
+            self.cached_analytics.property_count += property_ids.len() as u64;
+            self.cached_analytics.last_updated = timestamp;
 
-                let transaction_hash: Hash = [0u8; 32].into();
-                self.env().emit_event(BatchPropertyRegistered {
-                    owner: caller,
-                    event_version: 1,
-                    property_ids: successes.clone(),
-                    count: successes.len() as u64,
-                    timestamp,
-                    block_number: self.env().block_number(),
-                    transaction_hash,
-                });
-            }
+            let transaction_hash: Hash = [0u8; 32].into();
+            self.env().emit_event(BatchPropertiesRegistered {
+                owner: caller,
+                event_version: 1,
+                property_ids: property_ids.clone(),
+                count: property_ids.len() as u64,
+                timestamp,
+                block_number: self.env().block_number(),
+                transaction_hash,
+            });
 
             let metrics = BatchMetrics {
-                total_items,
-                successful_items: successes.len() as u32,
-                failed_items: failures.len() as u32,
-                early_terminated,
+                total_items: property_ids.len() as u32,
+                successful_items: property_ids.len() as u32,
+                failed_items: 0,
+                early_terminated: false,
             };
-
             self.record_batch_operation(0, &metrics);
             self.track_gas_usage("batch_register_properties".as_bytes());
-
             self.log_audit_event(
                 caller,
                 SecurityEventType::BatchOperation,
                 SecuritySeverity::Low,
                 0,
-                total_items,
+                metrics.total_items,
             );
 
-            Ok(BatchResult {
-                successes,
-                failures,
-                metrics,
-            })
+            Ok(property_ids)
         }
 
         /// Batch transfers multiple properties to the same recipient
@@ -3772,6 +3759,12 @@ pub mod propchain_contracts {
         #[ink(message)]
         pub fn get_batch_config(&self) -> BatchConfig {
             self.batch_config.clone()
+        }
+
+        /// Returns the maximum number of properties that can be registered in a single batch.
+        #[ink(message)]
+        pub fn get_max_batch_size(&self) -> u32 {
+            self.batch_config.max_batch_size
         }
 
         /// Returns historical batch operation statistics.
