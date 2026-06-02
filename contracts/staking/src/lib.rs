@@ -109,11 +109,28 @@ mod staking {
     }
     #[ink(event)]
     pub struct EarlyWithdrawal {
-    #[ink(topic)]
-    pub staker: AccountId,
-    pub amount_returned: u128,
-    pub penalty: u128,
-}
+        #[ink(topic)]
+        pub staker: AccountId,
+        pub amount_returned: u128,
+        pub penalty: u128,
+    }
+
+    #[ink(event)]
+    pub struct VestingScheduleCreated {
+        #[ink(topic)]
+        pub staker: AccountId,
+        pub total_amount: u128,
+        pub cliff_block: u64,
+        pub end_block: u64,
+    }
+
+    #[ink(event)]
+    pub struct VestingRewardsClaimed {
+        #[ink(topic)]
+        pub staker: AccountId,
+        pub amount: u128,
+        pub total_vested: u128,
+    }
 
     #[ink(event)]
     pub struct ParamProposalExecuted {
@@ -338,6 +355,54 @@ mod staking {
             self.min_stake
         }
 
+        /// Get the vested amount for a staker with a vesting schedule.
+        /// Returns the total amount vested so far (at current block).
+        #[ink(message)]
+        pub fn get_vested_amount(&self, staker: AccountId) -> u128 {
+            if let Some(stake) = self.stakes.get(staker) {
+                if let Some(vesting) = stake.vesting_schedule {
+                    let now = self.env().block_number() as u64;
+                    vesting.calculate_vested_at_block(now)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+
+        /// Get the unvested amount for a staker with a vesting schedule.
+        /// Returns the total amount still locked and not yet claimable.
+        #[ink(message)]
+        pub fn get_unvested_amount(&self, staker: AccountId) -> u128 {
+            if let Some(stake) = self.stakes.get(staker) {
+                if let Some(vesting) = stake.vesting_schedule {
+                    let now = self.env().block_number() as u64;
+                    let vested = vesting.calculate_vested_at_block(now);
+                    vesting.total_amount.saturating_sub(vested)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+
+        /// Get claimable vested amount (vested but not yet claimed).
+        #[ink(message)]
+        pub fn get_claimable_vested_amount(&self, staker: AccountId) -> u128 {
+            if let Some(stake) = self.stakes.get(staker) {
+                if let Some(vesting) = stake.vesting_schedule {
+                    let now = self.env().block_number() as u64;
+                    vesting.claimable_at_block(now)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+
         /// Estimate projected staking rewards for a given amount, lock period, and duration.
         /// This is a read-only calculator — no state is modified.
         #[ink(message)]
@@ -416,6 +481,7 @@ mod staking {
                 reward_debt: self.acc_reward_per_share,
                 governance_delegate: None,
                 auto_compound: false,
+                vesting_schedule: None,
             };
 
             self.stakes.insert(caller, &stake_info);
@@ -437,9 +503,103 @@ mod staking {
             Ok(())
         }
 
+        /// Stake tokens with a vesting schedule for rewards.
+        /// Rewards are distributed according to the vesting schedule instead of being immediately claimable.
+        ///
+        /// # Arguments
+        /// * `amount` - The amount to stake
+        /// * `lock_period` - The lock period for the stake
+        /// * `total_reward_amount` - Total reward amount to vest over time
+        /// * `cliff_blocks` - Number of blocks until cliff (no rewards claimable before)
+        /// * `vesting_blocks` - Total number of blocks for linear vesting (from cliff to full vesting)
+        #[ink(message)]
+        pub fn stake_with_vesting(
+            &mut self,
+            amount: u128,
+            lock_period: LockPeriod,
+            total_reward_amount: u128,
+            cliff_blocks: u64,
+            vesting_blocks: u64,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+
+            if amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
+            if amount < self.min_stake {
+                return Err(Error::InsufficientAmount);
+            }
+            if self.stakes.contains(caller) {
+                return Err(Error::AlreadyStaked);
+            }
+            if total_reward_amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
+            if total_reward_amount > self.reward_pool {
+                return Err(Error::InsufficientPool);
+            }
+            if vesting_blocks == 0 {
+                return Err(Error::InvalidConfig);
+            }
+
+            let now = self.env().block_number() as u64;
+            let lock_until = now.saturating_add(lock_period.duration_blocks());
+            let cliff_block = now.saturating_add(cliff_blocks);
+            let end_block = cliff_block.saturating_add(vesting_blocks);
+
+            let vesting_schedule = VestingSchedule {
+                total_amount: total_reward_amount,
+                vested_amount: 0,
+                start_block: now,
+                cliff_block,
+                end_block,
+            };
+
+            let stake_info = StakeInfo {
+                staker: caller,
+                amount,
+                staked_at: now,
+                lock_until,
+                lock_period,
+                reward_debt: self.acc_reward_per_share,
+                governance_delegate: None,
+                auto_compound: false,
+                vesting_schedule: Some(vesting_schedule),
+            };
+
+            // Reserve the reward amount from the pool
+            self.reward_pool = self.reward_pool.saturating_sub(total_reward_amount);
+
+            self.stakes.insert(caller, &stake_info);
+            self.total_staked = self.total_staked.saturating_add(amount);
+            self.staker_list.push(caller);
+
+            // Grant governance power to self by default
+            let current_power = self.governance_power.get(caller).unwrap_or(0);
+            self.governance_power
+                .insert(caller, &current_power.saturating_add(amount));
+
+            self.env().emit_event(Staked {
+                staker: caller,
+                amount,
+                lock_period,
+                lock_until,
+            });
+
+            self.env().emit_event(VestingScheduleCreated {
+                staker: caller,
+                total_amount: total_reward_amount,
+                cliff_block,
+                end_block,
+            });
+
+            Ok(())
+        }
+
        /// Unstake tokens. If called before the lock period expires, a penalty
 /// of `early_withdrawal_penalty_bps` is deducted from the returned amount.
 /// The penalty amount is retained in the reward pool. 
+/// If vesting schedule exists, unvested rewards are returned to the reward pool.
         #[ink(message)]
         pub fn unstake(&mut self) -> Result<(), Error> {
              propchain_traits::non_reentrant!(self, {
@@ -460,6 +620,12 @@ mod staking {
         };
 
         let amount_returned = amount.saturating_sub(penalty);
+
+        // Return unvested rewards to the pool if vesting schedule exists
+        if let Some(vesting) = stake.vesting_schedule {
+            let unvested = vesting.total_amount.saturating_sub(vesting.vested_amount);
+            self.reward_pool = self.reward_pool.saturating_add(unvested);
+        }
 
         // Remove governance power
         self.remove_governance_power(&stake);
@@ -524,25 +690,53 @@ pub fn get_early_withdrawal_penalty_bps(&self) -> u128 {
                 let caller = self.env().caller();
                 let mut stake = self.stakes.get(caller).ok_or(Error::StakeNotFound)?;
 
-                let rewards = self.calculate_rewards(&stake);
-                if rewards == 0 {
+                // Determine how much can be claimed
+                let claimable_amount = if let Some(mut vesting) = stake.vesting_schedule {
+                    let now = self.env().block_number() as u64;
+                    let total_vested = vesting.calculate_vested_at_block(now);
+                    let claimable = total_vested.saturating_sub(vesting.vested_amount);
+                    if claimable == 0 {
+                        return Err(Error::NoRewards);
+                    }
+                    claimable
+                } else {
+                    // No vesting schedule, claim all accumulated rewards
+                    let rewards = self.calculate_rewards(&stake);
+                    if rewards == 0 {
+                        return Err(Error::NoRewards);
+                    }
+                    rewards
+                };
+
+                if claimable_amount == 0 {
                     return Err(Error::NoRewards);
                 }
-                if rewards > self.reward_pool {
+                if claimable_amount > self.reward_pool {
                     return Err(Error::InsufficientPool);
                 }
 
                 let now = self.env().block_number() as u64;
-                self.reward_pool = self.reward_pool.saturating_sub(rewards);
+                self.reward_pool = self.reward_pool.saturating_sub(claimable_amount);
 
-                if stake.auto_compound {
-                    stake.amount = stake.amount.saturating_add(rewards);
-                    self.total_staked = self.total_staked.saturating_add(rewards);
+                // Update vesting schedule if present
+                if let Some(mut vesting) = stake.vesting_schedule {
+                    vesting.vested_amount = vesting.vested_amount.saturating_add(claimable_amount);
+                    stake.vesting_schedule = Some(vesting);
+
+                    self.stakes.insert(caller, &stake);
+                    self.env().emit_event(VestingRewardsClaimed {
+                        staker: caller,
+                        amount: claimable_amount,
+                        total_vested: vesting.vested_amount,
+                    });
+                } else if stake.auto_compound {
+                    stake.amount = stake.amount.saturating_add(claimable_amount);
+                    self.total_staked = self.total_staked.saturating_add(claimable_amount);
 
                     // Update governance power
                     let power_holder = stake.governance_delegate.unwrap_or(stake.staker);
                     let current_power = self.governance_power.get(power_holder).unwrap_or(0);
-                    self.governance_power.insert(power_holder, &current_power.saturating_add(rewards));
+                    self.governance_power.insert(power_holder, &current_power.saturating_add(claimable_amount));
 
                     stake.staked_at = now;
                     stake.reward_debt = self.acc_reward_per_share;
@@ -550,7 +744,7 @@ pub fn get_early_withdrawal_penalty_bps(&self) -> u128 {
 
                     self.env().emit_event(RewardsReinvested {
                         staker: caller,
-                        amount: rewards,
+                        amount: claimable_amount,
                     });
                 } else {
                     stake.staked_at = now;
@@ -559,11 +753,11 @@ pub fn get_early_withdrawal_penalty_bps(&self) -> u128 {
 
                     self.env().emit_event(RewardsClaimed {
                         staker: caller,
-                        amount: rewards,
+                        amount: claimable_amount,
                     });
                 }
 
-                Ok(rewards)
+                Ok(claimable_amount)
             })
         }
 

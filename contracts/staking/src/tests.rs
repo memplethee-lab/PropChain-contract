@@ -1281,5 +1281,312 @@ fn set_early_withdrawal_penalty_max_cap() {
         assert_eq!(StakingTier::Platinum.reward_multiplier(), 135);
         assert_eq!(StakingTier::Diamond.reward_multiplier(), 150);
     }
+
+    // ---- Vesting Schedule Tests ----
+
+    #[ink::test]
+    fn stake_with_vesting_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        // Fund the reward pool
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        // Create a stake with vesting
+        set_caller(accounts.bob);
+        assert!(staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 2_000)
+            .is_ok());
+
+        let stake = staking.get_stake(accounts.bob).unwrap();
+        assert_eq!(stake.amount, 10_000);
+        assert!(stake.vesting_schedule.is_some());
+
+        let vesting = stake.vesting_schedule.unwrap();
+        assert_eq!(vesting.total_amount, 500_000);
+        assert_eq!(vesting.vested_amount, 0);
+    }
+
+    #[ink::test]
+    fn stake_with_vesting_zero_reward_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.stake_with_vesting(10_000, LockPeriod::Flexible, 0, 1_000, 2_000),
+            Err(Error::ZeroAmount)
+        );
+    }
+
+    #[ink::test]
+    fn stake_with_vesting_insufficient_pool_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(100_000).unwrap();
+
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 2_000),
+            Err(Error::InsufficientPool)
+        );
+    }
+
+    #[ink::test]
+    fn stake_with_vesting_zero_vesting_blocks_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 0),
+            Err(Error::InvalidConfig)
+        );
+    }
+
+    #[ink::test]
+    fn vesting_zero_before_cliff() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 2_000)
+            .unwrap();
+
+        // At block 0, vested amount should be 0 (cliff is at block 1_000 + start_block)
+        let vested = staking.get_vested_amount(accounts.bob);
+        assert_eq!(vested, 0);
+
+        let unvested = staking.get_unvested_amount(accounts.bob);
+        assert_eq!(unvested, 500_000);
+
+        let claimable = staking.get_claimable_vested_amount(accounts.bob);
+        assert_eq!(claimable, 0);
+    }
+
+    #[ink::test]
+    fn vesting_full_after_end_block() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 100, 200)
+            .unwrap();
+
+        // Advance past the end block
+        advance_block(400);
+
+        let vested = staking.get_vested_amount(accounts.bob);
+        assert_eq!(vested, 500_000);
+
+        let unvested = staking.get_unvested_amount(accounts.bob);
+        assert_eq!(unvested, 0);
+
+        let claimable = staking.get_claimable_vested_amount(accounts.bob);
+        assert_eq!(claimable, 500_000);
+    }
+
+    #[ink::test]
+    fn vesting_linear_between_cliff_and_end() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 1_000_000, 100, 200)
+            .unwrap();
+
+        // At cliff block (100), vesting starts
+        advance_block(100);
+        let vested_at_cliff = staking.get_vested_amount(accounts.bob);
+        assert_eq!(vested_at_cliff, 0); // Still at cliff, no vesting yet
+
+        // Halfway through vesting (block 150, mid-point between 100 and 300)
+        advance_block(50);
+        let vested_midpoint = staking.get_vested_amount(accounts.bob);
+        assert!(vested_midpoint > 0);
+        assert!(vested_midpoint < 1_000_000);
+        // Should be approximately 50% of 1_000_000
+        assert!(vested_midpoint >= 450_000 && vested_midpoint <= 550_000);
+    }
+
+    #[ink::test]
+    fn no_rewards_claimable_before_cliff() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 2_000)
+            .unwrap();
+
+        // Try to claim before cliff block is reached
+        assert_eq!(staking.claim_rewards(), Err(Error::NoRewards));
+    }
+
+    #[ink::test]
+    fn full_rewards_claimable_after_end_block() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 100, 200)
+            .unwrap();
+
+        // Advance past end block
+        advance_block(350);
+
+        let claimed = staking.claim_rewards().unwrap();
+        assert_eq!(claimed, 500_000);
+
+        let stake = staking.get_stake(accounts.bob).unwrap();
+        let vesting = stake.vesting_schedule.unwrap();
+        assert_eq!(vesting.vested_amount, 500_000);
+    }
+
+    #[ink::test]
+    fn partial_rewards_during_vesting_period() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 1_000_000, 100, 200)
+            .unwrap();
+
+        // Advance to halfway through vesting (block 150, assuming start at 0)
+        advance_block(150);
+
+        let claimable = staking.get_claimable_vested_amount(accounts.bob);
+        assert!(claimable > 0);
+        assert!(claimable < 1_000_000);
+
+        let claimed = staking.claim_rewards().unwrap();
+        assert_eq!(claimed, claimable);
+
+        // Verify vested_amount was updated
+        let stake = staking.get_stake(accounts.bob).unwrap();
+        let vesting = stake.vesting_schedule.unwrap();
+        assert_eq!(vesting.vested_amount, claimed);
+
+        // Advance to end and claim remaining
+        advance_block(100);
+        let remaining = staking.claim_rewards().unwrap();
+        assert!(remaining > 0);
+        assert_eq!(remaining + claimed, 1_000_000);
+    }
+
+    #[ink::test]
+    fn vesting_no_rewards_if_already_claimed() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(1_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 50, 100)
+            .unwrap();
+
+        // Advance past end block and claim all
+        advance_block(200);
+        let first_claim = staking.claim_rewards().unwrap();
+        assert_eq!(first_claim, 500_000);
+
+        // Try to claim again without new vesting
+        let result = staking.claim_rewards();
+        assert_eq!(result, Err(Error::NoRewards));
+    }
+
+    #[ink::test]
+    fn unstake_returns_unvested_to_pool() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        let initial_pool = 1_000_000_000u128;
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(initial_pool).unwrap();
+
+        set_caller(accounts.bob);
+        staking
+            .stake_with_vesting(10_000, LockPeriod::Flexible, 500_000, 1_000, 2_000)
+            .unwrap();
+
+        let pool_after_stake = staking.get_reward_pool();
+        assert_eq!(pool_after_stake, initial_pool - 500_000);
+
+        // Unstake before vesting is complete
+        staking.unstake().unwrap();
+
+        let final_pool = staking.get_reward_pool();
+        // Unvested amount (500_000) should be returned to pool
+        assert_eq!(final_pool, initial_pool);
+    }
+
+    #[ink::test]
+    fn vesting_schedule_struct_calculations() {
+        let vesting = VestingSchedule {
+            total_amount: 1_000,
+            vested_amount: 0,
+            start_block: 0,
+            cliff_block: 100,
+            end_block: 300,
+        };
+
+        // Before cliff: 0 vested
+        assert_eq!(vesting.calculate_vested_at_block(50), 0);
+
+        // At cliff: still 0 vested
+        assert_eq!(vesting.calculate_vested_at_block(100), 0);
+
+        // Halfway: ~500 vested
+        assert_eq!(vesting.calculate_vested_at_block(200), 500);
+
+        // At end: full amount
+        assert_eq!(vesting.calculate_vested_at_block(300), 1_000);
+
+        // After end: still full amount
+        assert_eq!(vesting.calculate_vested_at_block(500), 1_000);
+
+        // Claimable when vested_amount = 0
+        assert_eq!(vesting.claimable_at_block(200), 500);
+
+        // After claiming 500
+        let mut vesting_after_claim = vesting;
+        vesting_after_claim.vested_amount = 500;
+        assert_eq!(vesting_after_claim.claimable_at_block(200), 0);
+        assert_eq!(vesting_after_claim.claimable_at_block(300), 500);
+    }
 }
 

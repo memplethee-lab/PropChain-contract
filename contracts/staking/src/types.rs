@@ -56,6 +56,60 @@ impl LockPeriod {
     }
 }
 
+/// Vesting schedule for staking rewards.
+/// Rewards vest linearly between cliff_block and end_block.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct VestingSchedule {
+    /// Total amount of rewards that will be vested
+    pub total_amount: u128,
+    /// Amount already vested and claimed
+    pub vested_amount: u128,
+    /// Block at which vesting started
+    pub start_block: u64,
+    /// Block before which no rewards are claimable (cliff)
+    pub cliff_block: u64,
+    /// Block after which all rewards are fully vested
+    pub end_block: u64,
+}
+
+impl VestingSchedule {
+    /// Calculate the vested amount at a given block.
+    /// Returns 0 if before cliff, total_amount if after end, or linear interpolation in between.
+    pub fn calculate_vested_at_block(&self, current_block: u64) -> u128 {
+        if current_block < self.cliff_block {
+            return 0;
+        }
+        if current_block >= self.end_block {
+            return self.total_amount;
+        }
+
+        // Linear vesting between cliff and end
+        let blocks_elapsed = (current_block - self.cliff_block) as u128;
+        let total_vesting_blocks = (self.end_block - self.cliff_block) as u128;
+        if total_vesting_blocks == 0 {
+            return 0;
+        }
+
+        self.total_amount.saturating_mul(blocks_elapsed) / total_vesting_blocks
+    }
+
+    /// Get the claimable amount (vested but not yet claimed)
+    pub fn claimable_at_block(&self, current_block: u64) -> u128 {
+        let total_vested = self.calculate_vested_at_block(current_block);
+        total_vested.saturating_sub(self.vested_amount)
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -75,6 +129,8 @@ pub struct StakeInfo {
     pub reward_debt: u128,
     pub governance_delegate: Option<AccountId>,
     pub auto_compound: bool,
+    /// Optional vesting schedule for rewards
+    pub vesting_schedule: Option<VestingSchedule>,
 }
 
 #[derive(
