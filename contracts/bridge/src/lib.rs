@@ -255,6 +255,54 @@ mod bridge {
 
     impl scale::EncodeLike for StoredBridgeRequest {}
 
+    /// Emergency multi-sig request data structure
+    #[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    struct EmergencyRequest {
+        request_id: u64,
+        request_type: EmergencyRequestType,
+        proposed_by: AccountId,
+        signatures: Vec<AccountId>,
+        created_at: u64,
+        expires_at: Option<u64>,
+        executed: bool,
+        // For pause_bridge: the pause flags and reason
+        pause_flags: Option<PauseFlags>,
+        pause_reason: Option<PauseReason>,
+        pause_detail: Option<String>,
+        // For freeze_asset: asset address and reason
+        asset_address: Option<AccountId>,
+        freeze_reason: Option<String>,
+    }
+
+    /// Types of emergency multi-sig requests
+    #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    enum EmergencyRequestType {
+        PauseBridge,
+        FreezeAsset,
+    }
+
+    /// Asset freeze information
+    #[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    struct AssetFreezeInfo {
+        asset_address: AccountId,
+        frozen_by: AccountId,
+        frozen_at: u64,
+        reason: String,
+        affects_inflight: bool,
+    }
+
     /// Bridge contract for cross-chain property token transfers
     #[ink(storage)]
     pub struct PropertyBridge {
@@ -370,6 +418,18 @@ mod bridge {
         travel_rule_data: Mapping<u64, TravelRuleData>,
         /// Jurisdiction-specific travel rule thresholds (chain_id -> minimum amount requiring compliance).
         travel_rule_thresholds: Mapping<ChainId, u128>,
+
+        // ── Emergency multi-sig for pause/freeze operations ────────────────
+        /// Emergency multi-sig members authorized to trigger pause/freeze operations.
+        emergency_signers: Vec<AccountId>,
+        /// Number of signatures required for emergency multi-sig operations.
+        emergency_threshold: u8,
+        /// Pending emergency multi-sig requests (request_id -> request data).
+        emergency_requests: Mapping<u64, EmergencyRequest>,
+        /// Emergency request counter.
+        emergency_request_counter: u64,
+        /// Frozen assets (asset_address -> freeze info).
+        frozen_assets: Mapping<AccountId, AssetFreezeInfo>,
     }
 
     /// Events for bridge operations
@@ -550,6 +610,65 @@ mod bridge {
         pub timestamp: u64,
     }
 
+    // ── Emergency multi-sig events ────────────────────────────────────────
+
+    /// Emitted when an emergency multi-sig request is created.
+    #[ink(event)]
+    pub struct EmergencyRequestCreated {
+        #[ink(topic)]
+        pub request_id: u64,
+        #[ink(topic)]
+        pub request_type: EmergencyRequestType,
+        #[ink(topic)]
+        pub proposed_by: AccountId,
+        pub timestamp: u64,
+    }
+
+    /// Emitted when an emergency multi-sig request is signed.
+    #[ink(event)]
+    pub struct EmergencyRequestSigned {
+        #[ink(topic)]
+        pub request_id: u64,
+        #[ink(topic)]
+        pub signer: AccountId,
+        pub signatures_collected: u8,
+        pub signatures_required: u8,
+    }
+
+    /// Emitted when an emergency multi-sig request is executed.
+    #[ink(event)]
+    pub struct EmergencyRequestExecuted {
+        #[ink(topic)]
+        pub request_id: u64,
+        #[ink(topic)]
+        pub request_type: EmergencyRequestType,
+        #[ink(topic)]
+        pub executed_by: AccountId,
+        pub timestamp: u64,
+    }
+
+    /// Emitted when an asset is frozen.
+    #[ink(event)]
+    pub struct AssetFrozen {
+        #[ink(topic)]
+        pub asset_address: AccountId,
+        #[ink(topic)]
+        pub frozen_by: AccountId,
+        pub reason: String,
+        pub affects_inflight: bool,
+        pub timestamp: u64,
+    }
+
+    /// Emitted when an asset freeze is lifted.
+    #[ink(event)]
+    pub struct AssetUnfrozen {
+        #[ink(topic)]
+        pub asset_address: AccountId,
+        #[ink(topic)]
+        pub unfrozen_by: AccountId,
+        pub timestamp: u64,
+    }
+
     impl PropertyBridge {
         /// Creates a new PropertyBridge contract
         #[ink(constructor)]
@@ -611,6 +730,11 @@ mod bridge {
                 failed_signatures_window_start: 0,
                 travel_rule_data: Mapping::default(),
                 travel_rule_thresholds: Mapping::default(),
+                emergency_signers: Vec::new(),
+                emergency_threshold: 2, // Default threshold
+                emergency_requests: Mapping::default(),
+                emergency_request_counter: 0,
+                frozen_assets: Mapping::default(),
             };
 
             // Set up default chain information
@@ -673,6 +797,9 @@ mod bridge {
             // Enforce rate limiting
             // For NFT bridge, we count requests but value is 0 here since NFT value isn't strictly defined by amount.
             self.check_and_update_rate_limits(caller, destination_chain, 0, true)?;
+
+            // Check if asset is frozen
+            self.ensure_asset_not_frozen(token_id)?;
 
             // Create bridge request
             self.request_counter += 1;
@@ -759,6 +886,9 @@ mod bridge {
             }
 
             self.check_and_update_rate_limits(caller, *route.last().unwrap(), 0, true)?;
+
+            // Check if asset is frozen
+            self.ensure_asset_not_frozen(token_id)?;
 
             let total_gas_estimate = self.estimate_multi_hop_bridge_gas(route.clone())?;
 
@@ -958,6 +1088,9 @@ mod bridge {
 
                 // FATF travel rule compliance check
                 self.ensure_travel_rule_compliance(request_id, &request)?;
+
+                // Check if asset is frozen
+                self.ensure_asset_not_frozen(request.token_id)?;
 
                 // Generate transaction hash
                 let transaction_hash = self.generate_transaction_hash(&request);
@@ -1854,6 +1987,312 @@ mod bridge {
             if auto_pause {
                 let flags = pause_flags_for_reason(&reason);
                 self.apply_pause(caller, flags, reason, detail);
+            }
+            Ok(())
+        }
+
+        // ── Emergency multi-sig for pause/freeze operations ─────────────────
+
+        /// Add an emergency signer. Admin only.
+        #[ink(message)]
+        pub fn add_emergency_signer(&mut self, signer: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            if !self.emergency_signers.contains(&signer) {
+                self.emergency_signers.push(signer);
+            }
+            Ok(())
+        }
+
+        /// Remove an emergency signer. Admin only.
+        #[ink(message)]
+        pub fn remove_emergency_signer(&mut self, signer: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.emergency_signers.retain(|s| s != &signer);
+            Ok(())
+        }
+
+        /// Set the emergency signature threshold. Admin only.
+        #[ink(message)]
+        pub fn set_emergency_threshold(&mut self, threshold: u8) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            if threshold == 0 || threshold > self.emergency_signers.len() as u8 {
+                return Err(Error::InsufficientSignatures);
+            }
+            self.emergency_threshold = threshold;
+            Ok(())
+        }
+
+        /// Get the current emergency signers and threshold.
+        #[ink(message)]
+        pub fn get_emergency_config(&self) -> (Vec<AccountId>, u8) {
+            (self.emergency_signers.clone(), self.emergency_threshold)
+        }
+
+        /// Propose a bridge pause via emergency multi-sig.
+        #[ink(message)]
+        pub fn propose_pause_bridge(
+            &mut self,
+            flags: PauseFlags,
+            reason: PauseReason,
+            detail: Option<String>,
+            timeout_blocks: Option<u64>,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            if !self.emergency_signers.contains(&caller) {
+                return Err(Error::NotEmergencySigner);
+            }
+
+            self.emergency_request_counter += 1;
+            let request_id = self.emergency_request_counter;
+            let current_block = u64::from(self.env().block_number());
+            let expires_at = timeout_blocks.map(|blocks| current_block + blocks);
+
+            let request = EmergencyRequest {
+                request_id,
+                request_type: EmergencyRequestType::PauseBridge,
+                proposed_by: caller,
+                signatures: vec![caller],
+                created_at: current_block,
+                expires_at,
+                executed: false,
+                pause_flags: Some(flags),
+                pause_reason: Some(reason),
+                pause_detail: detail,
+                asset_address: None,
+                freeze_reason: None,
+            };
+
+            self.emergency_requests.insert(request_id, &request);
+
+            self.env().emit_event(EmergencyRequestCreated {
+                request_id,
+                request_type: EmergencyRequestType::PauseBridge,
+                proposed_by: caller,
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(request_id)
+        }
+
+        /// Propose an asset freeze via emergency multi-sig.
+        #[ink(message)]
+        pub fn propose_freeze_asset(
+            &mut self,
+            asset_address: AccountId,
+            reason: String,
+            affects_inflight: bool,
+            timeout_blocks: Option<u64>,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            if !self.emergency_signers.contains(&caller) {
+                return Err(Error::NotEmergencySigner);
+            }
+
+            self.emergency_request_counter += 1;
+            let request_id = self.emergency_request_counter;
+            let current_block = u64::from(self.env().block_number());
+            let expires_at = timeout_blocks.map(|blocks| current_block + blocks);
+
+            let request = EmergencyRequest {
+                request_id,
+                request_type: EmergencyRequestType::FreezeAsset,
+                proposed_by: caller,
+                signatures: vec![caller],
+                created_at: current_block,
+                expires_at,
+                executed: false,
+                pause_flags: None,
+                pause_reason: None,
+                pause_detail: None,
+                asset_address: Some(asset_address),
+                freeze_reason: Some(reason),
+            };
+
+            self.emergency_requests.insert(request_id, &request);
+
+            self.env().emit_event(EmergencyRequestCreated {
+                request_id,
+                request_type: EmergencyRequestType::FreezeAsset,
+                proposed_by: caller,
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(request_id)
+        }
+
+        /// Sign an emergency multi-sig request.
+        #[ink(message)]
+        pub fn sign_emergency_request(&mut self, request_id: u64) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if !self.emergency_signers.contains(&caller) {
+                return Err(Error::NotEmergencySigner);
+            }
+
+            let mut request = self
+                .emergency_requests
+                .get(request_id)
+                .ok_or(Error::InvalidRequest)?;
+
+            if request.executed {
+                return Err(Error::EmergencyRequestAlreadyExecuted);
+            }
+
+            if let Some(expires_at) = request.expires_at {
+                if u64::from(self.env().block_number()) > expires_at {
+                    return Err(Error::EmergencyRequestExpired);
+                }
+            }
+
+            if request.signatures.contains(&caller) {
+                return Err(Error::AlreadySigned);
+            }
+
+            request.signatures.push(caller);
+            self.emergency_requests.insert(request_id, &request);
+
+            self.env().emit_event(EmergencyRequestSigned {
+                request_id,
+                signer: caller,
+                signatures_collected: request.signatures.len() as u8,
+                signatures_required: self.emergency_threshold,
+            });
+
+            Ok(())
+        }
+
+        /// Execute an emergency multi-sig request once threshold is reached.
+        #[ink(message)]
+        pub fn execute_emergency_request(&mut self, request_id: u64) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if !self.emergency_signers.contains(&caller) {
+                return Err(Error::NotEmergencySigner);
+            }
+
+            let mut request = self
+                .emergency_requests
+                .get(request_id)
+                .ok_or(Error::InvalidRequest)?;
+
+            if request.executed {
+                return Err(Error::EmergencyRequestAlreadyExecuted);
+            }
+
+            if let Some(expires_at) = request.expires_at {
+                if u64::from(self.env().block_number()) > expires_at {
+                    return Err(Error::EmergencyRequestExpired);
+                }
+            }
+
+            if request.signatures.len() < self.emergency_threshold as usize {
+                return Err(Error::InsufficientEmergencySignatures);
+            }
+
+            request.executed = true;
+            self.emergency_requests.insert(request_id, &request);
+
+            match request.request_type {
+                EmergencyRequestType::PauseBridge => {
+                    let flags = request.pause_flags.ok_or(Error::InvalidRequest)?;
+                    let reason = request.pause_reason.ok_or(Error::InvalidRequest)?;
+                    let detail = request.pause_detail.clone();
+                    self.apply_pause(caller, flags, reason, detail);
+                }
+                EmergencyRequestType::FreezeAsset => {
+                    let asset_address = request.asset_address.ok_or(Error::InvalidRequest)?;
+                    let freeze_reason = request.freeze_reason.ok_or(Error::InvalidRequest)?;
+                    self.apply_asset_freeze(caller, asset_address, freeze_reason, true);
+                }
+            }
+
+            self.env().emit_event(EmergencyRequestExecuted {
+                request_id,
+                request_type: request.request_type,
+                executed_by: caller,
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(())
+        }
+
+        /// Get an emergency request by ID.
+        #[ink(message)]
+        pub fn get_emergency_request(&self, request_id: u64) -> Option<EmergencyRequest> {
+            self.emergency_requests.get(request_id)
+        }
+
+        /// Check if an asset is frozen.
+        #[ink(message)]
+        pub fn is_asset_frozen(&self, asset_address: AccountId) -> bool {
+            self.frozen_assets.get(asset_address).is_some()
+        }
+
+        /// Get freeze info for an asset.
+        #[ink(message)]
+        pub fn get_asset_freeze_info(&self, asset_address: AccountId) -> Option<AssetFreezeInfo> {
+            self.frozen_assets.get(asset_address)
+        }
+
+        /// Unfreeze an asset. Admin only.
+        #[ink(message)]
+        pub fn unfreeze_asset(&mut self, asset_address: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+
+            if self.frozen_assets.get(asset_address).is_none() {
+                return Err(Error::AssetNotFrozen);
+            }
+
+            self.frozen_assets.remove(asset_address);
+
+            self.env().emit_event(AssetUnfrozen {
+                asset_address,
+                unfrozen_by: self.env().caller(),
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(())
+        }
+
+        /// Apply an asset freeze to storage.
+        fn apply_asset_freeze(
+            &mut self,
+            frozen_by: AccountId,
+            asset_address: AccountId,
+            reason: String,
+            affects_inflight: bool,
+        ) {
+            let freeze_info = AssetFreezeInfo {
+                asset_address,
+                frozen_by,
+                frozen_at: self.env().block_timestamp(),
+                reason,
+                affects_inflight,
+            };
+
+            self.frozen_assets.insert(asset_address, &freeze_info);
+
+            self.env().emit_event(AssetFrozen {
+                asset_address,
+                frozen_by,
+                reason,
+                affects_inflight,
+                timestamp: self.env().block_timestamp(),
+            });
+        }
+
+        /// Check if an asset transfer should be blocked due to freeze.
+        fn ensure_asset_not_frozen(&self, asset_address: AccountId) -> Result<(), Error> {
+            if let Some(freeze_info) = self.frozen_assets.get(asset_address) {
+                if freeze_info.affects_inflight {
+                    return Err(Error::OperationPaused);
+                }
             }
             Ok(())
         }

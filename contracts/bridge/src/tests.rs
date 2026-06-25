@@ -38,6 +38,177 @@ mod tests {
     }
 
     #[ink::test]
+    fn test_emergency_multi_sig_pause_bridge() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Add emergency signers
+        bridge
+            .add_emergency_signer(accounts.bob)
+            .expect("add emergency signer");
+        bridge
+            .add_emergency_signer(accounts.charlie)
+            .expect("add emergency signer");
+
+        // Set threshold to 2
+        bridge
+            .set_emergency_threshold(2)
+            .expect("set emergency threshold");
+
+        // Propose pause bridge as bob
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let pause_flags = propchain_traits::PauseFlags {
+            all_operations: true,
+            new_requests: true,
+            signing: false,
+            execution: false,
+            cross_chain_trades: false,
+        };
+        let request_id = bridge
+            .propose_pause_bridge(
+                pause_flags,
+                propchain_traits::PauseReason::ManualAdmin,
+                Some(String::from("Test pause")),
+                Some(100),
+            )
+            .expect("propose pause bridge");
+
+        // Sign as charlie
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge
+            .sign_emergency_request(request_id)
+            .expect("sign emergency request");
+
+        // Execute as bob
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .execute_emergency_request(request_id)
+            .expect("execute emergency request");
+
+        // Verify bridge is paused
+        let flags = bridge.get_pause_flags();
+        assert!(flags.all_operations);
+        assert!(flags.new_requests);
+    }
+
+    #[ink::test]
+    fn test_emergency_multi_sig_freeze_asset() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Add emergency signers
+        bridge
+            .add_emergency_signer(accounts.bob)
+            .expect("add emergency signer");
+        bridge
+            .add_emergency_signer(accounts.charlie)
+            .expect("add emergency signer");
+
+        // Set threshold to 2
+        bridge
+            .set_emergency_threshold(2)
+            .expect("set emergency threshold");
+
+        // Propose freeze asset as bob
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let asset_address = AccountId::from([1u8; 32]);
+        let request_id = bridge
+            .propose_freeze_asset(
+                asset_address,
+                String::from("Suspicious activity detected"),
+                true,
+                Some(100),
+            )
+            .expect("propose freeze asset");
+
+        // Sign as charlie
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge
+            .sign_emergency_request(request_id)
+            .expect("sign emergency request");
+
+        // Execute as bob
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .execute_emergency_request(request_id)
+            .expect("execute emergency request");
+
+        // Verify asset is frozen
+        assert!(bridge.is_asset_frozen(asset_address));
+
+        // Unfreeze as admin
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .unfreeze_asset(asset_address)
+            .expect("unfreeze asset");
+
+        // Verify asset is not frozen
+        assert!(!bridge.is_asset_frozen(asset_address));
+    }
+
+    #[ink::test]
+    fn test_asset_freeze_blocks_bridge_initiation() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Add emergency signers and set threshold
+        bridge
+            .add_emergency_signer(accounts.bob)
+            .expect("add emergency signer");
+        bridge
+            .add_emergency_signer(accounts.charlie)
+            .expect("add emergency signer");
+        bridge
+            .set_emergency_threshold(2)
+            .expect("set emergency threshold");
+
+        // Freeze asset token_id = 1
+        let token_id = 1;
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = bridge
+            .propose_freeze_asset(
+                AccountId::from([1u8; 32]), // Using token_id as account for simplicity
+                String::from("Test freeze"),
+                true,
+                Some(100),
+            )
+            .expect("propose freeze asset");
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        bridge
+            .sign_emergency_request(request_id)
+            .expect("sign emergency request");
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .execute_emergency_request(request_id)
+            .expect("execute emergency request");
+
+        // Try to initiate bridge with frozen asset - should fail
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let metadata = PropertyMetadata {
+            location: String::from("Test Property"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 100000,
+            documents_url: String::from("ipfs://test"),
+        };
+
+        let result = bridge.initiate_bridge_multisig(
+            AccountId::from([1u8; 32]), // Frozen asset
+            2,
+            accounts.bob,
+            2,
+            Some(50),
+            metadata,
+        );
+        assert!(result.is_err());
+    }
+
+    #[ink::test]
     fn test_initiate_multi_hop_bridge_two_hops() {
         let mut bridge = setup_bridge();
         let accounts = test::default_accounts::<DefaultEnvironment>();
