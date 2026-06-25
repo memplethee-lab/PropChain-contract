@@ -3226,6 +3226,23 @@ mod propchain_insurance {
             }
             Ok(())
         }
+
+        /// Return the current health status of this contract.
+        #[ink(message)]
+        pub fn health(&self) -> propchain_traits::monitoring::HealthReport {
+            let total_operations = self.policy_count.saturating_add(self.claim_count);
+            let error_rate_bips = 0u32; // Insurance contract tracks claims, not errors
+            
+            propchain_traits::monitoring::HealthReport {
+                contract_name: String::from("insurance"),
+                status: propchain_traits::monitoring::HealthStatus::Healthy,
+                reported_at: self.env().block_timestamp(),
+                total_operations,
+                error_count: 0,
+                error_rate_bips,
+                is_accepting_calls: true,
+            }
+        }
     }
 
     impl Default for PropertyInsurance {
