@@ -1,5 +1,248 @@
 // Unit tests for the PropertyToken contract (Issue #101 - extracted from lib.rs)
 
+// ============================================================================
+// ERC-721 conformance test suite (Issue #561)
+// Exercises the full ERC-721 surface and verifies behaviour against the spec.
+// ============================================================================
+#[cfg(test)]
+mod erc721_conformance {
+    use super::*;
+    use ink::env::{test, DefaultEnvironment};
+
+    fn sample_metadata() -> PropertyMetadata {
+        PropertyMetadata {
+            location: String::from("1 Blockchain Ave"),
+            size: 500,
+            legal_description: String::from("Conformance test property"),
+            valuation: 1_000_000,
+            documents_url: String::from("ipfs://QmConformance"),
+        }
+    }
+
+    fn setup() -> (PropertyToken, TokenId) {
+        let mut contract = PropertyToken::new();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let token_id = contract
+            .register_property_with_token(sample_metadata())
+            .expect("setup mint failed");
+        (contract, token_id)
+    }
+
+    // ── name ────────────────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_name_returns_string() {
+        let (contract, _) = setup();
+        let n = contract.name();
+        assert!(!n.is_empty(), "name() must not be empty");
+    }
+
+    // ── symbol ──────────────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_symbol_returns_string() {
+        let (contract, _) = setup();
+        let s = contract.symbol();
+        assert!(!s.is_empty(), "symbol() must not be empty");
+    }
+
+    // ── balanceOf ───────────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_balance_of_owner_is_one() {
+        let (contract, _) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert_eq!(contract.balance_of(accounts.alice), 1);
+    }
+
+    #[ink::test]
+    fn conformance_balance_of_non_owner_is_zero() {
+        let (contract, _) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert_eq!(contract.balance_of(accounts.bob), 0);
+    }
+
+    // ── ownerOf ─────────────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_owner_of_minted_token() {
+        let (contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert_eq!(contract.owner_of(token_id), Some(accounts.alice));
+    }
+
+    #[ink::test]
+    fn conformance_owner_of_nonexistent_is_none() {
+        let (contract, _) = setup();
+        assert_eq!(contract.owner_of(999), None);
+    }
+
+    // ── approve / getApproved ───────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_approve_and_get_approved() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        assert_eq!(contract.get_approved(token_id), None);
+        contract.approve(accounts.bob, token_id).unwrap();
+        assert_eq!(contract.get_approved(token_id), Some(accounts.bob));
+    }
+
+    #[ink::test]
+    fn conformance_approve_nonexistent_token_fails() {
+        let (mut contract, _) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert_eq!(
+            contract.approve(accounts.bob, 999),
+            Err(Error::TokenNotFound)
+        );
+    }
+
+    #[ink::test]
+    fn conformance_approve_by_non_owner_fails() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.approve(accounts.charlie, token_id),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    // ── setApprovalForAll / isApprovedForAll ────────────────────────────────
+    #[ink::test]
+    fn conformance_set_approval_for_all() {
+        let (mut contract, _) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        assert!(!contract.is_approved_for_all(accounts.alice, accounts.bob));
+        contract.set_approval_for_all(accounts.bob, true).unwrap();
+        assert!(contract.is_approved_for_all(accounts.alice, accounts.bob));
+    }
+
+    #[ink::test]
+    fn conformance_revoke_approval_for_all() {
+        let (mut contract, _) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        contract.set_approval_for_all(accounts.bob, true).unwrap();
+        contract.set_approval_for_all(accounts.bob, false).unwrap();
+        assert!(!contract.is_approved_for_all(accounts.alice, accounts.bob));
+    }
+
+    // ── transferFrom ────────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_owner_can_transfer_from() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        contract
+            .transfer_from(accounts.alice, accounts.bob, token_id)
+            .unwrap();
+
+        assert_eq!(contract.owner_of(token_id), Some(accounts.bob));
+        assert_eq!(contract.balance_of(accounts.alice), 0);
+        assert_eq!(contract.balance_of(accounts.bob), 1);
+    }
+
+    #[ink::test]
+    fn conformance_approved_can_transfer_from() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.approve(accounts.bob, token_id).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract
+            .transfer_from(accounts.alice, accounts.bob, token_id)
+            .unwrap();
+        assert_eq!(contract.owner_of(token_id), Some(accounts.bob));
+    }
+
+    #[ink::test]
+    fn conformance_operator_can_transfer_from() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.set_approval_for_all(accounts.bob, true).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract
+            .transfer_from(accounts.alice, accounts.bob, token_id)
+            .unwrap();
+        assert_eq!(contract.owner_of(token_id), Some(accounts.bob));
+    }
+
+    #[ink::test]
+    fn conformance_transfer_clears_approval() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.approve(accounts.bob, token_id).unwrap();
+        contract
+            .transfer_from(accounts.alice, accounts.bob, token_id)
+            .unwrap();
+        assert_eq!(contract.get_approved(token_id), None);
+    }
+
+    #[ink::test]
+    fn conformance_unauthorized_transfer_fails() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.transfer_from(accounts.alice, accounts.bob, token_id),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    // ── safeTransferFrom ────────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_safe_transfer_from_owner() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        contract
+            .safe_transfer_from(accounts.alice, accounts.bob, token_id)
+            .unwrap();
+        assert_eq!(contract.owner_of(token_id), Some(accounts.bob));
+    }
+
+    #[ink::test]
+    fn conformance_safe_transfer_from_unauthorized_fails() {
+        let (mut contract, token_id) = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.safe_transfer_from(accounts.alice, accounts.bob, token_id),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    // ── conformance report ──────────────────────────────────────────────────
+    #[ink::test]
+    fn conformance_report_is_valid_json_structure() {
+        let (contract, _) = setup();
+        let report = contract.erc721_conformance_report();
+        assert!(report.contains("\"ERC-721\""), "report must identify standard");
+        assert!(report.contains("\"implemented\": 10"), "all 10 functions must be implemented");
+        assert!(report.contains("\"compliance_level\": \"full\""));
+        assert!(report.contains("\"balanceOf\""));
+        assert!(report.contains("\"ownerOf\""));
+        assert!(report.contains("\"approve\""));
+        assert!(report.contains("\"getApproved\""));
+        assert!(report.contains("\"setApprovalForAll\""));
+        assert!(report.contains("\"isApprovedForAll\""));
+        assert!(report.contains("\"transferFrom\""));
+        assert!(report.contains("\"safeTransferFrom\""));
+        assert!(report.contains("\"name\""));
+        assert!(report.contains("\"symbol\""));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
