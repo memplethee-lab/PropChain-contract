@@ -9,7 +9,8 @@
 )]
 
 use ink::prelude::string::String;
-use ink::storage::Mapping;
+use ink::storage::{Lazy, Mapping};
+use ink::prelude::collections::HashMap as StorageHashMap;
 use propchain_traits::*;
 use propchain_traits::{non_reentrant, ReentrancyError, ReentrancyGuard};
 #[cfg(not(feature = "std"))]
@@ -35,8 +36,10 @@ pub mod property_token {
         // ERC-721 standard mappings
         token_owner: Mapping<TokenId, AccountId>,
         owner_token_count: Mapping<AccountId, u32>,
-        token_approvals: Mapping<TokenId, AccountId>,
-        operator_approvals: Mapping<(AccountId, AccountId), bool>,
+        token_approvals: Lazy<StorageHashMap<TokenId, AccountId>>,
+        operator_approvals: Lazy<StorageHashMap<(AccountId, AccountId), ()>>,
+        // Ephemeral (instance) storage for frequently-read operator approvals
+        ephemeral_operators: Lazy<StorageHashMap<(AccountId, AccountId), ()>>,
 
         // ERC-1155 batch operation support
         balances: Mapping<(AccountId, TokenId), u128>,
@@ -601,8 +604,9 @@ pub mod property_token {
                 // ERC-721 standard mappings
                 token_owner: Mapping::default(),
                 owner_token_count: Mapping::default(),
-                token_approvals: Mapping::default(),
-                operator_approvals: Mapping::default(),
+                token_approvals: Lazy::new(StorageHashMap::new()),
+                operator_approvals: Lazy::new(StorageHashMap::new()),
+                ephemeral_operators: Lazy::new(StorageHashMap::new()),
 
                 // ERC-1155 batch operation support
                 balances: Mapping::default(),
